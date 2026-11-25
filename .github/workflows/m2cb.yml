@@ -18,7 +18,7 @@ jobs:
       - name: m2cb
         env:
           SSH_PRIVATE_KEY: ${{ secrets.CB_PUSH_KEY }}
-          CBR: git@codeberg.org/krazykllh/rusty_scanner.git
+          CBR: ssh://git@codeberg.org/krazykllh/rusty_scanner.git
         run: |
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
