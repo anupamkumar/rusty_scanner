@@ -1,0 +1,27 @@
+name: m2cb
+
+on:
+  push:
+    branches: ['**']
+    tags: ['**']
+  workflow_dispatch:
+
+jobs:
+  mirror:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout full history
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: m2cb
+        env:
+          SSH_PRIVATE_KEY: ${{ secrets.CB_PUSH_KEY }}
+          CBR: git@codeberg.org/krazykllh/rusty_scanner.git
+        run: |
+          mkdir -p ~/.ssh
+          echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
+          chmod 600 ~/.ssh/id_ed25519
+          ssh-keyscan -t ed25519 codeberg.org >> ~/.ssh/known_hosts
+          git push --prune "$CBR" +refs/remotes/origin/*:refs/heads/* +refs/tags/*:refs/tags/*
