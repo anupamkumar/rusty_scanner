@@ -1,0 +1,30 @@
+version: 1.0
+
+# ==============================================================================
+# ANCHOR DIRECTORIES CONFIGURATION (Map Style)
+# ==============================================================================
+# Each key under `anchors:` MUST be an absolute path to an anchor directory.
+#
+# Per-anchor fields (all optional):
+#   - aliases: List of alternate names / acronyms for matching misc video files.
+#              Note: The anchor directory's own basename (both raw and normalized
+#              with technical tags stripped) is automatically included!
+#   - destination: Where matched files (or Rank #2-#4 symlinks) are placed.
+#                  - Omitted / empty : Root of the anchor directory (default).
+#                  - Relative path   : Resolved inside the anchor directory
+#                                      (e.g., `incoming/2026` -> `<anchor>/incoming/2026`).
+#                  - Absolute path   : Used as-is.
+# ==============================================================================
+anchors:
+  /Volumes/DriveA/Anime/DBZ_h265:
+    aliases:
+      - DragonBall Z
+      - Dragon Ball Z
+    destination: incoming/2026
+
+  /Volumes/DriveB/StudioX:
+    aliases:
+      - Studio X Official
+      - SX
+
+  /Volumes/DriveC/Artist_One: {}

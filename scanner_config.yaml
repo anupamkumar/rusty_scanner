@@ -1,0 +1,201 @@
+version: 1.0
+
+# ==============================================================================
+# RUSTY INTELLI SCANNER — NON-SHORT-CIRCUITING COMPOSITE MATCHING & NLP CONFIG
+# ==============================================================================
+# How `rusty_scanner` evaluates and ranks each miscellaneous video file against
+# the anchor directories defined in `anchors.yaml` / `anchor_dirs.yaml`:
+#
+# 1. TWO-CHANNEL EVIDENCE EVALUATION (ZERO SHORT-CIRCUITING):
+#    Every candidate video is ALWAYS evaluated across BOTH channels in full:
+#      - Directory Channel (`S_dir`):
+#          Evaluates enclosing directory names from innermost parent outward up
+#          to AND INCLUDING the passed misc directory's own basename (e.g.
+#          `.../downloads/Abbie Cat H265`) across all 4 tiers + NLP POS weights.
+#      - Title Channel (`S_title`):
+#          Evaluates the video's filename stem (clauses, whole-word phrases,
+#          compact affixes, and fuzzy clauses) weighted by NLP Part-of-Speech.
+#
+#    Both signals fuse into a single composite score (`confidence_score`):
+#      score = min(1.0, max(dir_weight * S_dir, title_weight * S_title)
+#                       + corroboration_boost * min(S_dir, S_title))
+#
+#    - `dir_weight` (0.97) gives heavy influence to the enclosing directory name
+#      without ignoring filename evidence.
+#    - When BOTH directory AND filename corroborate the same anchor,
+#      `corroboration_boost` (0.08) elevates the match to `DIR_AND_TITLE` (1.0000).
+#
+# 2. NLP PART-OF-SPEECH (POS) NOUN WEIGHTING (`nlp:` section below):
+#    Tokens in video titles, directory names, and anchor names are tagged into
+#    6 POS classes so Nouns and Proper Nouns carry much heavier weight than
+#    adjectives, verbs/gerunds, shared honorifics, and function words:
+#      * `ProperNoun`   (1.00) : Creator / performer / studio names (`Abbie`, `Kendra`)
+#      * `Noun`         (0.85) : Concrete & nominal nouns (`palace`, `empire`, `boots`)
+#      * `Verb`         (0.50) : Action verbs & `-ing`/`-ed` gerunds (`smoking`, `laying`)
+#      * `Adjective`    (0.45) : Descriptive modifiers (`candid`, `new`, `sexy`, `sweet`)
+#      * `Honorific`    (0.35) : Shared role prefixes (`mistress`, `goddess`, `princess`)
+#      * `FunctionWord` (0.15) : Prepositions, articles, conjunctions, adverbs
+#
+#    - Incidental adjectives/verbs inside scene titles (e.g., `"Candid Smoking"`
+#      vs `candid_h265`) are scaled below `min_effective_score` (`0.84`).
+#    - In fuzzy matching, head Proper Nouns / Nouns carry ~3x the weight of
+#      shared honorifics, blocking `"Mistress Mia"` != `"Mistress Mira"` while
+#      catching genuine typos (`"Goddess Allexandra Snow"`).
+#
+# 3. DETERMINISTIC MULTI-ANCHOR RANKING & ACTION ASSIGNMENT:
+#    Matched anchors are sorted by:
+#      (1) Higher fused `confidence_score` (DESC)
+#      (2) Earlier `clause_position` (ASC)
+#      (3) Longer matched alias/name alphanumeric length (DESC)
+#      (4) Declaration order in `anchors.yaml` (ASC)
+#
+#    - Rank #1 Anchor : `PRIMARY_MOVE` (dedup via `rusty_dedup` + `rusty_clean` or move)
+#    - Ranks #2 .. #(1 + max_secondary_symlinks) : `SYMLINK` to Rank #1's winner
+# ==============================================================================
+matching:
+  exact_clause_score: 1.00
+  whole_token_score: 0.95
+  compact_affix_score: 0.90
+  compact_min_chars: 4
+
+  fuzzy_enabled: true
+  fuzzy_min_similarity: 0.88
+  fuzzy_max_score: 0.94
+  fuzzy_min_chars: 5
+
+  match_relative_subdirs: true
+  dir_weight: 0.97
+  title_weight: 0.95
+  corroboration_boost: 0.08
+
+  # Number of secondary ranking anchors that receive symlinks on multi-anchor matches.
+  # Default 3 => Ranks #2, #3, and #4 receive symlinks to Rank #1's surviving file.
+  max_secondary_symlinks: 3
+
+  # Technical encoding, container, framerate, and resolution tags stripped during normalization:
+  noise_tokens:
+    - 1080p
+    - 720p
+    - 2160p
+    - 1440p
+    - 4k
+    - 480p
+    - 360p
+    - 240p
+    - x264
+    - x265
+    - h264
+    - h265
+    - hevc
+    - avc
+    - aac
+    - ac3
+    - eac3
+    - mp3
+    - opus
+    - flac
+    - webrip
+    - web-dl
+    - webdl
+    - bluray
+    - brrip
+    - dvdrip
+    - hdrip
+    - uhd
+    - 60fps
+    - 30fps
+
+# ==============================================================================
+# NLP PART-OF-SPEECH (POS) WEIGHTING SETTINGS
+# ==============================================================================
+nlp:
+  enabled: true
+  proper_noun_weight: 1.00
+  noun_weight: 0.85
+  verb_weight: 0.50
+  adjective_weight: 0.45
+  honorific_weight: 0.35
+  function_word_weight: 0.15
+  nlp_influence: 0.35
+  min_effective_score: 0.84
+
+# ==============================================================================
+# EXTERNAL TOOLING, METRICS HARNESS & STATE PATHS (Live Run Mode)
+# ==============================================================================
+# `rusty_dedup` is always invoked via `rusty_dedup_metrics_harness.py` (`auto`
+# discovers `scripts/rusty_dedup_metrics_harness.py` alongside `rusty_dedup`)
+# so all 3 Prometheus/Grafana telemetry layers (Rust domain snapshot + OS kernel
+# threads/ffmpeg children + Host CPU/RAM/GPU) are captured accurately.
+# ==============================================================================
+tools:
+  python_bin: python3
+  dedup_metrics_harness: auto
+  # Seconds the harness holds `/metrics` alive after each anchor's `rusty_dedup`
+  # exits so Prometheus scrapes final counters (`auto` uses harness default 20s;
+  # set e.g. `6.0` for faster multi-anchor turnover with a 5s scrape_interval):
+  harness_linger_secs: 6.0
+  rusty_dedup_bin: auto
+  rusty_clean_bin: auto
+  dedup_config: auto
+  decision_config: auto
+  states_dir: .states
+
+# ==============================================================================
+# PERSISTENT JOB REPORTS & INTERACTIVE DRILL-DOWN HTML AUDIT DASHBOARD
+# ==============================================================================
+# Every execution archives all raw `rusty_dedup` (`dedup/*.json`) and
+# `rusty_clean` (`clean/*.json`) job reports alongside `run_manifest.json` and
+# an interactive self-contained HTML5 report (`execution_report.html`) inside
+# `<output_dir>/run_<YYYYMMDD_HHMMSS>_<pid>/`, plus `<output_dir>/latest_report.html`.
+# ==============================================================================
+reports:
+  enabled: true
+  output_dir: ./reports
+  # Set to `true` to also pass `--categories-log` to `rusty_dedup` and archive
+  # pair-level dHash frame match % and sliding-window offsets (`dedup/*_pairs.json`):
+  capture_pair_categories_log: false
+
+# ==============================================================================
+# LIGHTWEIGHT HTTP REPORT SERVER (View Dashboard in Any Browser Anywhere)
+# ==============================================================================
+# Serves `<reports.output_dir>` over HTTP (Multi-Run Hub at `/`, newest report at
+# `/latest`, plus live-updating JSON manifests and raw `dups.json` / `clean.json`).
+#
+#   • Standalone 24/7 server : `./target/release/rusty_scanner -c scanner_config.yaml --serve-reports`
+#   • Background helper      : `./scripts/report_server.sh start` (survives SSH disconnects)
+#   • Automatic in-run host  : when `serve_during_run: true`, live executions also
+#     host the dashboard automatically (skipping cleanly if `--serve-reports` is
+#     already bound to `listen_addr`).
+# ==============================================================================
+report_server:
+  enabled: true
+  listen_addr: 0.0.0.0:8787
+  serve_during_run: true
+  # Seconds to keep the in-process server alive after a run completes (`0` = exit immediately):
+  linger_after_run_secs: 0
+  # Browser auto-refresh interval (in seconds) while a run is `IN_PROGRESS` (`0` = manual refresh):
+  live_refresh_secs: 5
+
+# Supported video extensions (case-insensitive, without leading dot):
+video_extensions:
+  - mp4
+  - mkv
+  - avi
+  - wmv
+  - mov
+  - flv
+  - webm
+  - m4v
+  - mpg
+  - mpeg
+  - ts
+  - mts
+  - m2ts
+  - vob
+  - ogv
+  - 3gp
+  - asf
+  - rm
+  - rmvb
+  - divx
+  - f4v
