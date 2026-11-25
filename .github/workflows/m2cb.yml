@@ -19,7 +19,17 @@ jobs:
         env:
           SSH_PRIVATE_KEY: ${{ secrets.CB_PUSH_KEY }}
           CBR: ssh://git@codeberg.org/krazykllh/rusty_scanner.git
+          OLD_EMAIL: anu
+          NEW_NAME: krazykllh
+          NEW_EMAIL: krazykllh@tuta.com
         run: |
+          FILTER_BRANCH_SQUELCH_WARNING=1 git filter-branch -f --env-filter '
+              export GIT_AUTHOR_NAME="$NEW_NAME"
+              export GIT_AUTHOR_EMAIL="$NEW_EMAIL"
+              export GIT_COMMITTER_NAME="$NEW_NAME"
+              export GIT_COMMITTER_EMAIL="$NEW_EMAIL"
+          ' --tag-name-filter cat -- --all
+
           mkdir -p ~/.ssh
           echo "$SSH_PRIVATE_KEY" > ~/.ssh/id_ed25519
           chmod 600 ~/.ssh/id_ed25519
