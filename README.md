@@ -1,4 +1,4 @@
-# Rusty Intelli Scanner Suite
+# Rusty Intelli Scanner
 
 ### An app to automatically organize your video library
 
