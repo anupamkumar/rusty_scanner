@@ -122,6 +122,7 @@ The suite consists of **two primary Rust binaries built from this repository**, 
 
 ### How a Video Travels Through the System
 
+0. **Prerequisite — Build & Import Your Anchor Directories (`anchors.yaml`)**: Before your first scan, compile the suite (`cargo build --release`) and register your existing organized library folders in `anchors.yaml`—either by copying [`anchor_example.yaml`](anchor_example.yaml) or auto-importing your folders from disk with `find` (see [`anchor_example.yaml`](anchor_example.yaml) for copy-paste import commands, optional `aliases` & `destination` rules, and generic examples).
 1. **Discovery & Classification**: Point `rusty_scanner` at one or more unsorted directories. Use `--dry-run` first if you want a zero-risk preview (`anchor_matches.csv` + `un.txt`), or run live mode directly.
 2. **Optional Interactive Triage**: Open leftover unmatched files (`un.txt`) in `rusty_triage`. Assign files via `[1]`–`[5]` suggestions, whole-directory shortcuts (`D`), or new aliases (`a`), then either press `X` to execute immediately or `w` to save `manual_matches.csv` for `rusty_scanner --from-csv`.
 3. **Per-Anchor Batch Consolidation**: Matches are grouped by their **Rank #1** anchor and processed one anchor batch at a time:
@@ -132,21 +133,18 @@ The suite consists of **two primary Rust binaries built from this repository**, 
 4. **Live Archiving & Web Reporting**: After *every* anchor batch finishes, raw JSON reports are archived and `execution_report.html` refreshes live via the built-in HTTP server (`0.0.0.0:8787`).
 
 ```text
-  Unsorted ("Misc") Video Directories / Files
-                     │
-                     ▼
-    ┌────────────────────────────────────────┐
-    │  rusty_scanner (Two-Channel + NLP)     │──(--dry-run)──► anchor_matches.csv + un.txt
-    └───────────────────┬────────────────────┘                                    │
-                        │                                                         ▼
-                        │                                         ┌───────────────────────────────┐
-                        │                                         │  rusty_triage (Ratatui TUI)   │
-                        │                                         │  • Smart Suggestions [1]-[5]  │
-                        │                                         │  • Assign File / Whole Dir(D) │
-                        │                                         │  • Live Alias Auto-Sweep (a)  │
-                        │                                         │  • Create New Anchor (n)      │
-                        │                                         └───────────────┬───────────────┘
-                        │◄────────────(--from-csv manual_matches.csv / [X])───────┘
+  [Step 0] Build Binaries + Import Existing Library Folders ──► anchors.yaml
+                                                                     │
+    Unsorted ("Misc") Files          ┌───────────────────────────────┴──────────────────┐
+              │                      │                                                  │
+              ▼                      ▼                                                  ▼
+    ┌────────────────────────────────────────┐                               ┌───────────────────────────────┐
+    │  rusty_scanner (Two-Channel + NLP)     │──(--dry-run)──► un.txt ──────►│  rusty_triage (Ratatui TUI)   │
+    └───────────────────┬────────────────────┘   (+ anchor_matches.csv)      │  • Smart Suggestions [1]-[5]  │
+                        │                                                    │  • Assign File / Whole Dir(D) │
+                        │                                                    │  • Live Alias Auto-Sweep (a)  │
+                        │                                                    │  • Create New Anchor (n)      │
+                        │◄──────────(--from-csv manual_matches.csv / [X])────┴───────────────────────────────┘
                         ▼
     ┌───────────────────────────────────────────────────────────────────────────┐
     │  Live Consolidation Orchestrator (Grouped Per Rank #1 Anchor Batch)       │
@@ -256,7 +254,19 @@ Compiled binaries:
 
 ## 8. Quick-Start & End-to-End Workflows
 
-1. **Create your `anchors.yaml`**: Copy [`anchor_example.yaml`](anchor_example.yaml) to `anchors.yaml` and list the absolute paths to your library's destination folders (plus any optional `aliases` or `destination` sub-folders).
+1. **Build the binaries & import your anchor directories into `anchors.yaml`**:
+   - Compile with `cargo build --release`.
+   - Copy [`anchor_example.yaml`](anchor_example.yaml) to `anchors.yaml` (it contains a full beginner guide on required vs. optional fields and generic examples), **or** auto-import all your existing top-level library folders at once:
+     ```bash
+     {
+       echo "version: 1.0"
+       echo "anchors:"
+       find "/Volumes/DriveA/Media" "/Volumes/DriveB/Archive" \
+         -mindepth 1 -maxdepth 1 -type d | sort | while IFS= read -r dir; do
+         printf '  "%s":\n    aliases: []\n' "$dir"
+       done
+     } > anchors.yaml
+     ```
 2. **Review `scanner_config.yaml`**: Defaults work out of the box; `tools:` (`auto`) automatically locates `rusty_dedup`, `rusty_clean`, and `rusty_dedup_metrics_harness.py` if installed alongside or on your `PATH`.
 
 ```bash

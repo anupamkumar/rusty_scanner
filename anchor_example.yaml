@@ -1,30 +1,119 @@
 version: 1.0
 
 # ==============================================================================
-# ANCHOR DIRECTORIES CONFIGURATION (Map Style)
+# ANCHOR DIRECTORIES GUIDE & TEMPLATE (`anchors.yaml`)
 # ==============================================================================
-# Each key under `anchors:` MUST be an absolute path to an anchor directory.
+# WHAT IS THIS FILE?
+#   This file tells `rusty_scanner` and `rusty_triage` where your organized
+#   library folders ("anchors") live on disk so incoming unsorted videos can be
+#   matched, visually deduplicated against what you already own, and moved in.
 #
-# Per-anchor fields (all optional):
-#   - aliases: List of alternate names / acronyms for matching misc video files.
-#              Note: The anchor directory's own basename (both raw and normalized
-#              with technical tags stripped) is automatically included!
-#   - destination: Where matched files (or Rank #2-#4 symlinks) are placed.
-#                  - Omitted / empty : Root of the anchor directory (default).
-#                  - Relative path   : Resolved inside the anchor directory
-#                                      (e.g., `incoming/2026` -> `<anchor>/incoming/2026`).
-#                  - Absolute path   : Used as-is.
+# HOW TO GET STARTED:
+#   Option A — Copy this template and edit it by hand:
+#     cp anchor_example.yaml anchors.yaml
+#
+#   Option B — Auto-import hundreds of existing folders from your drive(s) at once
+#              (macOS / Linux bash or zsh):
+#     {
+#       echo "version: 1.0"
+#       echo "anchors:"
+#       find "/Volumes/DriveA/Media" "/Volumes/DriveB/Archive" \
+#         -mindepth 1 -maxdepth 1 -type d | sort | while IFS= read -r dir; do
+#         printf '  "%s":\n    aliases: []\n' "$dir"
+#       done
+#     } > anchors.yaml
+#
+#   Tip: You do NOT need to think of every nickname upfront! Start with plain
+#   folder paths, run a scan, and press `a` inside `rusty_triage` whenever you
+#   want to teach an anchor a new alias (or `n` to create a brand-new anchor).
+#
 # ==============================================================================
+# WHAT EACH ANCHOR MUST & MAY CONTAIN
+# ==============================================================================
+# 1. ANCHOR PATH (REQUIRED — the map key under `anchors:`):
+#    - Must be an ABSOLUTE directory path (e.g., `/Volumes/DriveA/Shows/Cosmos`
+#      on macOS, `/mnt/nas/Shows/Cosmos` on Linux, or `"D:\Media\Shows\Cosmos"`
+#      on Windows).
+#    - Wrap paths in quotes `"..."` if they contain spaces or special characters
+#      like `#` or `:`.
+#    - Automatic name matching: Every anchor automatically matches its own
+#      folder name—both raw (`DBZ_h265`) and stripped of technical tags (`DBZ`).
+#      You do NOT need to repeat the folder's own name inside `aliases`.
+#
+# 2. `aliases` (OPTIONAL — omit completely, leave empty `[]`, or list strings):
+#    - Alternate names, full titles, acronyms, studio handles, or common
+#      spellings that should also route videos into this folder.
+#    - Can be written as a multi-line YAML list (`- Name`) or inline
+#      (`aliases: ["Name 1", "Name 2"]`).
+#    - Short acronyms (like `SX` or `DBZ`) are guarded automatically so `SX`
+#      matches `[SX] Episode_01.mp4` without false-matching `sxsw_panel.mp4`.
+#
+# 3. `destination` (OPTIONAL — omit completely if files belong in the root):
+#    - Controls WHERE newly matched videos (and Rank #2-#4 collaboration
+#      symlinks) are placed, while `rusty_dedup` still checks the ENTIRE anchor
+#      root directory (and all its subfolders) for visual duplicates!
+#    - If omitted / empty : Files land directly inside the anchor root folder.
+#    - If relative path   : Placed inside a subfolder of the anchor
+#                           (e.g., `incoming/2026` -> `<anchor>/incoming/2026`).
+#    - If absolute path   : Placed at that exact path on any drive
+#                           (e.g., `/Volumes/FastSSD/Review/StudioAlpha`).
+# ==============================================================================
+
 anchors:
-  /Volumes/DriveA/Anime/DBZ_h265:
+
+  # ----------------------------------------------------------------------------
+  # Example 1: Minimal anchor (ONLY the path is required)
+  # Matches "Artist One", "Artist_One", "artist.one", etc. automatically, and
+  # places consolidated videos directly inside `/Volumes/DriveA/Creators/Artist_One`.
+  # ----------------------------------------------------------------------------
+  "/Volumes/DriveA/Creators/Artist_One": {}
+
+  # ----------------------------------------------------------------------------
+  # Example 2: Auto-imported style (empty `aliases: []`, spaces & codec tag in path)
+  # Because `_h265` is stripped automatically as a technical tag, this matches
+  # "Ocean Planet" right away—and is ready for `rusty_triage` (`a`) to append aliases.
+  # ----------------------------------------------------------------------------
+  "/Volumes/DriveA/Documentaries/Ocean Planet_h265":
+    aliases: []
+
+  # ----------------------------------------------------------------------------
+  # Example 3: Anchor with inline `aliases` (acronyms + alternate spellings)
+  # Matches "StudioX", "Studio X Official", "Studio-X", or "[SX]" in filenames/folders.
+  # ----------------------------------------------------------------------------
+  "/Volumes/DriveB/Studios/StudioX":
+    aliases: ["Studio X Official", "SX"]
+
+  # ----------------------------------------------------------------------------
+  # Example 4: Full-featured anchor (multi-line `aliases` + relative `destination`)
+  # Deduplicates against ALL seasons already inside `/Volumes/DriveA/Anime/DBZ_h265`,
+  # but places newly consolidated files neatly into `.../DBZ_h265/incoming/2026`.
+  # ----------------------------------------------------------------------------
+  "/Volumes/DriveA/Anime/DBZ_h265":
     aliases:
       - DragonBall Z
       - Dragon Ball Z
     destination: incoming/2026
 
-  /Volumes/DriveB/StudioX:
+  # ----------------------------------------------------------------------------
+  # Example 5: Split-storage anchor (archive on HDD + external absolute `destination`)
+  # Checks the cold HDD archive `/Volumes/ColdArchive/Lectures/MIT_Physics` for
+  # duplicates, while landing surviving new videos onto `/Volumes/FastSSD/NewLectures`.
+  # ----------------------------------------------------------------------------
+  "/Volumes/ColdArchive/Lectures/MIT_Physics":
     aliases:
-      - Studio X Official
-      - SX
+      - MIT OpenCourseWare Physics
+      - OCW Physics
+    destination: "/Volumes/FastSSD/NewLectures/MIT_Physics"
 
-  /Volumes/DriveC/Artist_One: {}
+  # ----------------------------------------------------------------------------
+  # Example 6: Compact one-line shorthand (path mapped directly to `[aliases]`)
+  # Equivalent to writing `aliases: ["Cosmos Series", "CSC"]` with default destination.
+  # ----------------------------------------------------------------------------
+  "/Volumes/DriveB/Shows/Cosmos": ["Cosmos Series", "CSC"]
+
+  # ----------------------------------------------------------------------------
+  # Windows Path Example (uncomment on Windows — always quote `C:\...` drive paths):
+  # ----------------------------------------------------------------------------
+  # "D:\Media\Channels\TechWeekly_h265":
+  #   aliases: ["Tech Weekly", "TW"]
+  #   destination: "2026_Inbox"
