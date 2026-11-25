@@ -1,4 +1,6 @@
-# `rusty_scanner` & `rusty_triage` — Rusty Intelli Scanner Suite
+Rusty Intelli Scanner Suite
+
+### An app to automatically organize your video library
 
 Automated video library intake, intelligent classification, interactive terminal triage, visual duplicate consolidation, and live browser-based audit reporting—built in Rust.
 
