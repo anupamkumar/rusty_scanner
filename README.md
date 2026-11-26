@@ -93,6 +93,8 @@ The suite consists of **two primary Rust binaries built from this repository**, 
 
 - **Anchor (Anchor Directory)**
   A permanent, organized destination folder in your library—for example, `/Volumes/DriveA/Anime/DBZ_h265` or `/Volumes/DriveB/StudioX`. It is called an *anchor* for two reasons: (1) incoming unsorted clips "gravitate" toward it when matched, and (2) the existing videos already inside it act as the reference baseline when checking for duplicates.
+  ![anchors_gif](./anchor_illustrated.gif)
+  
 - **`anchors.yaml` (Aliases & Custom Destinations)**
   The YAML map listing all your anchor directories. Under each anchor path, you can optionally list:
   - **`aliases`**: Alternate names, acronyms, or spellings that also belong to this anchor (e.g., `["DragonBall Z", "DBZ"]`). Note: the folder's own name—both raw and with technical tags like `_h265` stripped—is always included automatically.
