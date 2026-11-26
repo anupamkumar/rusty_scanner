@@ -83,7 +83,7 @@ The suite consists of **two primary Rust binaries built from this repository**, 
 | **`rusty_dedup`** | Companion binary (auto-discovered via `scanner_config.yaml`) | **The Visual Duplicate Detector.** Decodes video frames and compares perceptual visual fingerprints (`dHash`) with sliding-window time alignment. Finds duplicate videos even if renamed, re-encoded (`H264` vs `HEVC` vs `AV1`), resized, or slightly trimmed, writing `*_dups.json`. |
 | **`rusty_clean`** | Companion binary (auto-discovered via `scanner_config.yaml`) | **The Quality Judge & Consolidator.** Reads `rusty_dedup`'s duplicate groups, scores each copy across 8 video/audio quality metrics, keeps the highest-scoring winner, removes inferior duplicates, moves winners into the target folder, and writes `*_clean.json`. |
 | **`rusty_dedup_metrics_harness.py`** | Companion Python wrapper (`auto` in `scanner_config.yaml`) | **The Live Telemetry Wrapper.** Launches `rusty_dedup` while exposing a Prometheus `/metrics` endpoint that captures internal Rust progress, OS threads / `ffmpeg` child processes, and host CPU/RAM/GPU usage. |
-| **`scripts/report_server.sh`** & **`scripts/build_binaries.sh`** | Included helper scripts (`./scripts/`) | `report_server.sh` starts/stops `rusty_scanner --serve-reports` in the background (surviving SSH disconnects); `build_binaries.sh` compiles and packages release tarballs/zips with SHA-256 checksums for macOS, Linux, and Windows. |
+| **`build_binary.sh`** & **`scripts/report_server.sh`** | Included helper scripts (`./` & `./scripts/`) | `build_binary.sh` (`./build_binary.sh` / `./scripts/build_binary.sh`) cross-compiles release & optional standalone test binaries for macOS, Linux, and Windows into `dist/` with `SHA256SUMS.txt`; `report_server.sh` starts/stops `rusty_scanner --serve-reports` in the background (surviving SSH disconnects). |
 
 > **Note:** You can use `--dry-run` in `rusty_scanner` and assign/organize/export CSVs in `rusty_triage` **without** needing `rusty_dedup` or `rusty_clean` installed. Those companion binaries are only invoked when you run live file consolidation.
 
@@ -233,22 +233,112 @@ The suite consists of **two primary Rust binaries built from this repository**, 
 
 ## 7. Build & Cross-Compilation
 
-Requires a standard Rust toolchain (`rustup` / `cargo`).
+### Pre-Built Executables (`dist/`)
+
+Ready-to-run executables for every supported operating system and CPU architecture are available in [`dist/`](dist/) (verify integrity anytime against [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt)):
+
+| Platform | CPU Architecture | `rusty_scanner` Binary | `rusty_triage` Binary |
+| :--- | :--- | :--- | :--- |
+| **macOS** | Apple Silicon (M1–M4 — `arm64`) | [`dist/rusty_scanner-macos-arm64`](dist/rusty_scanner-macos-arm64) | [`dist/rusty_triage-macos-arm64`](dist/rusty_triage-macos-arm64) |
+| **macOS** | Intel (`x86_64`) | [`dist/rusty_scanner-macos-x86_64`](dist/rusty_scanner-macos-x86_64) | [`dist/rusty_triage-macos-x86_64`](dist/rusty_triage-macos-x86_64) |
+| **Linux / Raspberry Pi** | ARM64 (`arm64` / `aarch64`) | [`dist/rusty_scanner-linux-arm64`](dist/rusty_scanner-linux-arm64) | [`dist/rusty_triage-linux-arm64`](dist/rusty_scanner-linux-arm64) |
+| **Linux** | 64-bit Intel/AMD (`x86_64`) | [`dist/rusty_scanner-linux-x86_64`](dist/rusty_scanner-linux-x86_64) | [`dist/rusty_triage-linux-x86_64`](dist/rusty_triage-linux-x86_64) |
+| **Windows** | 64-bit Intel/AMD (`x86_64`) | [`dist/rusty_scanner-windows-x86_64.exe`](dist/rusty_scanner-windows-x86_64.exe) | [`dist/rusty_triage-windows-x86_64.exe`](dist/rusty_triage-windows-x86_64.exe) |
+| **Windows** | ARM64 (`arm64`) | [`dist/rusty_scanner-windows-arm64.exe`](dist/rusty_scanner-windows-arm64.exe) | [`dist/rusty_triage-windows-arm64.exe`](dist/rusty_triage-windows-arm64.exe) |
+
+---
+
+### Prerequisites for Building from Source
+
+- **Rust toolchain** (`rustc` and `cargo`, install via [rustup.rs](https://rustup.rs/))
+- **Python 3** (used at runtime by `rusty_dedup_metrics_harness.py` and optionally during `--with-tests` artifact packaging)
+- **`rusty_dedup`, `rusty_clean`, FFmpeg & `ffprobe`** (runtime prerequisites when executing live consolidation)
+
+> **NOTE on Dependencies:**
+> Both `rusty_scanner` and `rusty_triage` use only pure-Rust crate dependencies (`anyhow`, `blake3`, `clap`, `crossterm`, `ratatui`, `rayon`, `serde`, `serde_json`, `strsim`, and `walkdir` in [`Cargo.toml`](Cargo.toml)). There are **no external C-library build dependencies** (no OpenSSL, libav, or ncurses dev headers required).
+>
+> For **cross-compiling** Linux and Windows binaries from macOS (see [Section 7.3](#73-cross-compiling-binaries-build_binarysh) below), install **Zig** (`brew install zig`) and **`cargo-zigbuild`** (`cargo install --locked cargo-zigbuild`).
+
+---
+
+### 7.1 Compile Native Release Binaries
 
 ```bash
 cd rusty_scanner
-
-# Native optimized release build (LTO + stripped symbols)
 cargo build --release
-
-# Cross-platform release packaging (macOS, Linux, Windows + SHA256SUMS.txt)
-./scripts/build_binaries.sh macos arm64
-./scripts/build_binaries.sh all
 ```
 
-Compiled binaries:
-- `target/release/rusty_scanner`
-- `target/release/rusty_triage`
+The optimized (LTO + stripped) executables will be created at:
+- **macOS / Linux:** `target/release/rusty_scanner` and `target/release/rusty_triage`
+- **Windows:** `target\release\rusty_scanner.exe` and `target\release\rusty_triage.exe`
+
+---
+
+### 7.2 Running Automated Tests
+
+```bash
+cargo test
+```
+
+Tests are organized into three suites under [`tests/`](tests/):
+- **`integration_tests.rs`** — Map-style `anchors.yaml` & `scanner_config.yaml` parsing, two-channel non-short-circuiting matching, NLP POS noun weighting, short-acronym / letter-spaced / sequel guards, `--dry-run` CSV output, `.rusty_scanner_hold_*` crash recovery, and end-to-end live consolidation under `rusty_dedup_metrics_harness.py`.
+- **`tui_tests.rs`** — `[1]`–`[5]` Smart Suggestions, parent-directory tree grouping & shared-root confirmation modal, live alias learning + Rayon auto-sweep (`a`), new anchor creation (`n`), `u` undo, headless `ratatui::TestBackend` rendering, and `--from-csv` execution.
+- **`html_report_tests.rs`** — Immutable preservation of `dedup/*_dups.json`, `dedup/*_pairs.json`, and `clean/*_clean.json`, `ANCHOR_UPGRADED` quality scoring & reclaimed-byte accounting, `--build-report` offline reconstruction, and HTTP report server routing + path-traversal blocking.
+
+---
+
+### 7.3 Cross-Compiling Binaries (`build_binary.sh`)
+
+[`build_binary.sh`](build_binary.sh) (also available at [`scripts/build_binary.sh`](scripts/build_binary.sh)) cross-compiles release binaries—and optional standalone test runner binaries—for every supported OS and CPU architecture from a single macOS machine.
+
+One-time cross-compilation setup on macOS:
+```bash
+brew install zig
+cargo install --locked cargo-zigbuild
+rustup target add \
+  aarch64-apple-darwin \
+  x86_64-apple-darwin \
+  x86_64-unknown-linux-gnu \
+  aarch64-unknown-linux-gnu \
+  x86_64-pc-windows-gnu \
+  aarch64-pc-windows-gnullvm
+```
+
+Build a single platform/architecture, Linux + Windows only, or all 6 targets at once:
+```bash
+# Build one target
+./build_binary.sh macos arm64
+./build_binary.sh macos x86_64
+./build_binary.sh linux arm64
+./build_binary.sh linux x86_64
+./build_binary.sh windows x86_64
+./build_binary.sh windows arm64
+
+# Build all Linux + Windows targets
+./build_binary.sh linux-windows
+
+# Also emit standalone cross-compiled test runner binaries into dist/
+./build_binary.sh windows x86_64 --with-tests
+./build_binary.sh linux arm64 --with-tests
+
+# Build every supported platform and architecture (12 release binaries total)
+./build_binary.sh all
+./build_binary.sh all --with-tests
+
+# Optional: compile strictly from locally cached Cargo crates without network access
+./build_binary.sh all --offline
+```
+
+All outputs are placed in [`dist/`](dist/) alongside an updated [`dist/SHA256SUMS.txt`](dist/SHA256SUMS.txt):
+
+| Command Arguments | Rust Target | Output Binaries in `dist/` |
+| :--- | :--- | :--- |
+| `macos arm64` | `aarch64-apple-darwin` | `dist/rusty_scanner-macos-arm64`, `dist/rusty_triage-macos-arm64` |
+| `macos x86_64` | `x86_64-apple-darwin` | `dist/rusty_scanner-macos-x86_64`, `dist/rusty_triage-macos-x86_64` |
+| `linux x86_64` | `x86_64-unknown-linux-gnu.2.31` | `dist/rusty_scanner-linux-x86_64`, `dist/rusty_triage-linux-x86_64` |
+| `linux arm64` | `aarch64-unknown-linux-gnu.2.31` | `dist/rusty_scanner-linux-arm64`, `dist/rusty_triage-linux-arm64` |
+| `windows x86_64` | `x86_64-pc-windows-gnu` | `dist/rusty_scanner-windows-x86_64.exe`, `dist/rusty_triage-windows-x86_64.exe` |
+| `windows arm64` | `aarch64-pc-windows-gnullvm` | `dist/rusty_scanner-windows-arm64.exe`, `dist/rusty_triage-windows-arm64.exe` |
 
 ---
 
