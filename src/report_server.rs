@@ -1,5 +1,7 @@
 use crate::config::{ReportServerConfig, normalize_path_lexical};
-use crate::html_report::{RunManifest, RunTotals};
+use crate::html_report::{
+    RunManifest, RunTotals, reconcile_and_persist_manifest, refresh_latest_report_shortcuts,
+};
 use anyhow::{Context, Result, bail};
 use serde::Serialize;
 use std::fs::{self, File};
@@ -306,6 +308,20 @@ fn route_and_write_http_response<W: Write>(
         );
     };
 
+    // Trigger run liveness reconciliation when requesting a run's HTML or manifest directly
+    if let Some(first_comp) = rel_clean.components().next() {
+        let comp_str = first_comp.as_os_str().to_string_lossy();
+        if comp_str.starts_with("run_") {
+            let run_dir = reports_root.join(first_comp.as_os_str());
+            let mpath = run_dir.join("run_manifest.json");
+            if let Ok(raw) = fs::read_to_string(&mpath) {
+                if let Ok(mut m) = serde_json::from_str::<RunManifest>(&raw) {
+                    let _ = reconcile_and_persist_manifest(&run_dir, &mut m);
+                }
+            }
+        }
+    }
+
     let candidate = if reports_root.join(&rel_clean).is_dir() {
         reports_root.join(&rel_clean).join("execution_report.html")
     } else {
@@ -470,12 +486,13 @@ fn hex_val(b: u8) -> Option<u8> {
     }
 }
 
-/// Discovers all `run_*` directories inside `reports_root` and returns their summaries sorted newest-first.
+/// Discovers all `run_*` directories inside `reports_root`, automatically reconciles dead-PID
+/// `"IN_PROGRESS"` runs to `"INTERRUPTED"`, and returns their summaries sorted newest-first.
 pub fn collect_run_hub_entries(reports_root: &Path) -> Vec<RunHubEntry> {
     let Ok(rd) = fs::read_dir(reports_root) else {
         return Vec::new();
     };
-    let mut runs = Vec::new();
+    let mut runs: Vec<(RunHubEntry, Option<(PathBuf, RunManifest, bool)>)> = Vec::new();
 
     for entry in rd.filter_map(|e| e.ok()) {
         let p = entry.path();
@@ -493,43 +510,53 @@ pub fn collect_run_hub_entries(reports_root: &Path) -> Vec<RunHubEntry> {
         }
 
         if let Ok(raw) = fs::read_to_string(&manifest_path) {
-            if let Ok(m) = serde_json::from_str::<RunManifest>(&raw) {
-                runs.push(RunHubEntry {
+            if let Ok(mut m) = serde_json::from_str::<RunManifest>(&raw) {
+                let changed = reconcile_and_persist_manifest(&p, &mut m);
+                let hub_entry = RunHubEntry {
                     report_url: format!("/{}/execution_report.html", folder_name),
                     manifest_url: format!("/{}/run_manifest.json", folder_name),
-                    run_id: m.run_id,
-                    mode: m.mode,
-                    status: m.status,
-                    started_at_utc: m.started_at_utc,
+                    run_id: m.run_id.clone(),
+                    mode: m.mode.clone(),
+                    status: m.status.clone(),
+                    started_at_utc: m.started_at_utc.clone(),
                     started_at_unix_ms: m.started_at_unix_ms,
-                    updated_at_utc: m.updated_at_utc,
+                    updated_at_utc: m.updated_at_utc.clone(),
                     elapsed_secs: m.elapsed_secs,
-                    totals: m.totals,
-                });
+                    totals: m.totals.clone(),
+                };
+                runs.push((hub_entry, Some((p, m, changed))));
                 continue;
             }
         }
 
-        runs.push(RunHubEntry {
-            report_url: format!("/{}/execution_report.html", folder_name),
-            manifest_url: format!("/{}/run_manifest.json", folder_name),
-            run_id: folder_name,
-            mode: "UNKNOWN".to_string(),
-            status: "COMPLETED".to_string(),
-            started_at_utc: String::new(),
-            started_at_unix_ms: 0,
-            updated_at_utc: String::new(),
-            elapsed_secs: 0.0,
-            totals: RunTotals::default(),
-        });
+        runs.push((
+            RunHubEntry {
+                report_url: format!("/{}/execution_report.html", folder_name),
+                manifest_url: format!("/{}/run_manifest.json", folder_name),
+                run_id: folder_name,
+                mode: "UNKNOWN".to_string(),
+                status: "COMPLETED".to_string(),
+                started_at_utc: String::new(),
+                started_at_unix_ms: 0,
+                updated_at_utc: String::new(),
+                elapsed_secs: 0.0,
+                totals: RunTotals::default(),
+            },
+            None,
+        ));
     }
 
-    runs.sort_by(|a, b| {
+    runs.sort_by(|(a, _), (b, _)| {
         b.started_at_unix_ms
             .cmp(&a.started_at_unix_ms)
             .then_with(|| b.run_id.cmp(&a.run_id))
     });
-    runs
+
+    if let Some((_, Some((_, newest_manifest, true)))) = runs.first() {
+        refresh_latest_report_shortcuts(reports_root, newest_manifest);
+    }
+
+    runs.into_iter().map(|(e, _)| e).collect()
 }
 
 fn detect_lan_ip() -> Option<String> {
@@ -612,6 +639,7 @@ const HUB_HTML_PREFIX: &str = r#"<!DOCTYPE html>
   --emerald: #34d399; --emerald-soft: rgba(52, 211, 153, 0.16);
   --amber: #fbbf24; --amber-soft: rgba(251, 191, 36, 0.16);
   --purple: #a78bfa; --purple-soft: rgba(167, 139, 250, 0.15);
+  --red: #f87171; --red-soft: rgba(248, 113, 113, 0.16);
   --mono: ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
   --sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Roboto, Helvetica, Arial, sans-serif;
 }
@@ -622,6 +650,7 @@ const HUB_HTML_PREFIX: &str = r#"<!DOCTYPE html>
   --emerald: #059669; --emerald-soft: rgba(5, 150, 105, 0.12);
   --amber: #d97706; --amber-soft: rgba(217, 119, 6, 0.12);
   --purple: #7c3aed; --purple-soft: rgba(124, 58, 237, 0.11);
+  --red: #dc2626; --red-soft: rgba(220, 38, 38, 0.12);
 }
 * { box-sizing: border-box; }
 body { margin: 0; background: var(--bg); color: var(--text); font-family: var(--sans); font-size: 14px; }
@@ -659,6 +688,7 @@ tr:hover td { background: var(--bg-hover); }
 }
 .p-done { background: var(--emerald-soft); color: var(--emerald); }
 .p-live { background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber); }
+.p-stop { background: var(--red-soft); color: var(--red); border: 1px solid rgba(248, 113, 113, 0.45); }
 .mono { font-family: var(--mono); }
 .empty { text-align: center; padding: 48px 20px; color: var(--text-muted); }
 </style>
@@ -705,10 +735,13 @@ const HUB_HTML_SUFFIX: &str = r#"
   }
 
   function render() {
-    const liveCount = RUNS.filter(r => r.status !== 'COMPLETED').length;
+    const liveCount = RUNS.filter(r => r.status === 'IN_PROGRESS').length;
+    const stoppedCount = RUNS.filter(r => r.status !== 'COMPLETED' && r.status !== 'IN_PROGRESS').length;
+    const statusSummary = liveCount > 0
+      ? (liveCount + ' LIVE IN PROGRESS (auto-refreshing every ' + HUB_POLL_SECS + 's)')
+      : (stoppedCount > 0 ? ('No active runs (' + stoppedCount + ' stopped)') : 'All runs completed');
     document.getElementById('hub-sub').textContent =
-      RUNS.length + ' saved execution run(s)  •  ' +
-      (liveCount > 0 ? (liveCount + ' LIVE IN PROGRESS (auto-refreshing every ' + HUB_POLL_SECS + 's)') : 'All runs completed');
+      RUNS.length + ' saved execution run(s)  •  ' + statusSummary;
 
     const latestBtn = document.getElementById('btn-open-latest');
     latestBtn.style.display = RUNS.length ? 'inline-block' : 'none';
@@ -745,10 +778,12 @@ const HUB_HTML_SUFFIX: &str = r#"
       '</tr></thead><tbody>' +
       RUNS.map(r => {
         const t = r.totals || {};
-        const isDone = r.status === 'COMPLETED';
+        const st = r.status || 'COMPLETED';
+        const pillCls = st === 'COMPLETED' ? 'p-done' : (st === 'IN_PROGRESS' ? 'p-live' : 'p-stop');
+        const pillText = st === 'COMPLETED' ? 'COMPLETED' : (st === 'IN_PROGRESS' ? 'LIVE' : 'STOPPED');
         const movedCnt = (t.direct_moves || 0) + (t.phase2_nondup_moves || 0);
         return '<tr>' +
-          '<td><span class="pill ' + (isDone ? 'p-done' : 'p-live') + '">' + esc(isDone ? 'COMPLETED' : 'LIVE') + '</span></td>' +
+          '<td><span class="pill ' + pillCls + '">' + esc(pillText) + '</span></td>' +
           '<td><div class="mono" style="font-weight:700;">' + esc(r.run_id) + '</div><div style="font-size:12px; color:var(--text-muted);">' + esc(fmtStart(r)) + ' • ' + Number(r.elapsed_secs || 0).toFixed(1) + 's</div></td>' +
           '<td class="mono">' + esc(r.mode) + '</td>' +
           '<td class="mono">' + (t.anchor_batches || 0) + '</td>' +

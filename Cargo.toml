@@ -1,6 +1,6 @@
 [package]
 name = "rusty_scanner"
-version = "0.1.0"
+version = "1.0.1"
 edition = "2024"
 description = "Rusty Intelli Scanner: matches miscellaneous video files to anchor directories, previews matches via CSV, and orchestrates rusty_dedup + rusty_clean consolidation with multi-anchor symlinks."
 

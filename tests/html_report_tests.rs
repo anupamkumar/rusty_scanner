@@ -59,6 +59,9 @@ fn persists_all_dedup_and_clean_reports_and_builds_drilldown_html_and_rebuilds_o
     let dedup_py = r#"#!/usr/bin/env python3
 import json, os, sys
 
+if "--record-moves" in sys.argv:
+    sys.exit(0)
+
 out_path = "duplicates.json"
 cat_log = None
 inputs = []
@@ -70,6 +73,13 @@ while i < len(sys.argv):
         i += 2
     elif a == "--categories-log":
         cat_log = sys.argv[i + 1]
+        i += 2
+    elif a == "--inputs-from":
+        with open(sys.argv[i + 1], "r", encoding="utf-8") as lf:
+            for line in lf:
+                s = line.strip()
+                if s:
+                    inputs.append(s)
         i += 2
     elif a in ("-c", "--dedup-config", "--config", "--states-dir"):
         i += 2
@@ -398,6 +408,256 @@ with open(report_out, "w") as f:
 
     let r_traversal = http_get("/..%2F..%2Fetc%2Fpasswd");
     assert!(r_traversal.starts_with("HTTP/1.1 403 Forbidden"));
+
+    let _ = fs::remove_dir_all(&base);
+}
+
+#[cfg(unix)]
+#[test]
+fn reconciles_dead_pid_runs_to_stopped_normalizes_4100_seq_jumps_and_batches_large_inputs_in_single_pass()
+{
+    let base = make_report_test_dir("pid_liveness_and_single_pass");
+    let reports_root = base.join("reports");
+    fs::create_dir_all(&reports_root).unwrap();
+
+    let mk_dummy_batch = |seq_id: usize, chunk_idx: usize, name: &str| {
+        serde_json::json!({
+            "seq_id": seq_id,
+            "pass_num": 1,
+            "chunk_idx": chunk_idx,
+            "anchor_name": name,
+            "anchor_path": format!("/Volumes/f0m/{}", name),
+            "destination_path": format!("/Volumes/f0m/{}", name),
+            "matched_input_count": 500,
+            "elapsed_ms": 1200,
+            "dedup_report_rel_path": "dedup/test_dups.json",
+            "clean_report_rel_path": null,
+            "pairs_log_rel_path": null,
+            "direct_moves": [],
+            "duplicate_groups": [],
+            "symlinks_created": [],
+            "symlinks_skipped_existing": 0,
+            "bytes_moved": 0,
+            "bytes_reclaimed": 0,
+            "duplicates_deleted": 0,
+            "anchor_upgrades_count": 0
+        })
+    };
+
+    // 1. Dead-PID run stuck in `"IN_PROGRESS"` with `seq_id` jump `69, 70, 4100, 4101, 4102`
+    let dead_dir = reports_root.join("run_20261125_010000_2147480001");
+    fs::create_dir_all(&dead_dir).unwrap();
+    fs::write(
+        dead_dir.join("run_manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "run_id": "run_20261125_010000_2147480001",
+            "mode": "LIVE_LOOP",
+            "status": "IN_PROGRESS",
+            "started_at_utc": "2026-11-25 01:00:00 UTC",
+            "started_at_unix_ms": 1795568400000u64,
+            "updated_at_utc": "2026-11-25 01:10:00 UTC",
+            "elapsed_secs": 600.0,
+            "inputs": ["/misc"],
+            "totals": {
+                "passes_executed": 1, "anchor_batches": 5, "dedup_runs": 5, "clean_runs": 0,
+                "misc_files_evaluated": 2500, "direct_moves": 0, "phase2_nondup_moves": 0,
+                "duplicate_groups": 0, "duplicates_deleted": 0, "anchor_upgrades": 0,
+                "existing_anchor_kept": 0, "misc_batch_deduped": 0, "intra_anchor_cleanup": 0,
+                "symlinks_created": 0, "symlinks_skipped_existing": 0,
+                "bytes_moved": 0, "bytes_reclaimed": 0, "unmatched_count": 0, "quarantined_error_count": 0
+            },
+            "anchor_batches": [
+                mk_dummy_batch(69, 0, "Anchor69"),
+                mk_dummy_batch(70, 0, "Anchor70"),
+                mk_dummy_batch(4100, 0, "Miss Courtney_h265"),
+                mk_dummy_batch(4101, 1, "Miss Courtney_h265"),
+                mk_dummy_batch(4102, 2, "Miss Courtney_h265")
+            ],
+            "unmatched_files": [],
+            "quarantined_files": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 2. Live-PID run (`std::process::id()`) that is genuinely active right now
+    let my_pid = std::process::id();
+    let live_run_id = format!("run_20261126_020000_{}", my_pid);
+    let live_dir = reports_root.join(&live_run_id);
+    fs::create_dir_all(&live_dir).unwrap();
+    fs::write(
+        live_dir.join("run_manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "run_id": live_run_id,
+            "pid": my_pid,
+            "mode": "LIVE_LOOP",
+            "status": "IN_PROGRESS",
+            "started_at_utc": "2026-11-26 02:00:00 UTC",
+            "started_at_unix_ms": 1795658400000u64,
+            "updated_at_utc": "2026-11-26 02:01:00 UTC",
+            "elapsed_secs": 60.0,
+            "inputs": ["/misc"],
+            "totals": {
+                "passes_executed": 1, "anchor_batches": 0, "dedup_runs": 0, "clean_runs": 0,
+                "misc_files_evaluated": 0, "direct_moves": 0, "phase2_nondup_moves": 0,
+                "duplicate_groups": 0, "duplicates_deleted": 0, "anchor_upgrades": 0,
+                "existing_anchor_kept": 0, "misc_batch_deduped": 0, "intra_anchor_cleanup": 0,
+                "symlinks_created": 0, "symlinks_skipped_existing": 0,
+                "bytes_moved": 0, "bytes_reclaimed": 0, "unmatched_count": 0, "quarantined_error_count": 0
+            },
+            "anchor_batches": [],
+            "unmatched_files": [],
+            "quarantined_files": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    // 3. Completed run
+    let done_dir = reports_root.join("run_20261127_030000_2147480002");
+    fs::create_dir_all(&done_dir).unwrap();
+    fs::write(
+        done_dir.join("run_manifest.json"),
+        serde_json::to_string_pretty(&serde_json::json!({
+            "run_id": "run_20261127_030000_2147480002",
+            "mode": "LIVE_LOOP",
+            "status": "COMPLETED",
+            "started_at_utc": "2026-11-27 03:00:00 UTC",
+            "started_at_unix_ms": 1795748400000u64,
+            "updated_at_utc": "2026-11-27 03:05:00 UTC",
+            "elapsed_secs": 300.0,
+            "inputs": ["/misc"],
+            "totals": {
+                "passes_executed": 1, "anchor_batches": 1, "dedup_runs": 1, "clean_runs": 0,
+                "misc_files_evaluated": 1, "direct_moves": 1, "phase2_nondup_moves": 0,
+                "duplicate_groups": 0, "duplicates_deleted": 0, "anchor_upgrades": 0,
+                "existing_anchor_kept": 0, "misc_batch_deduped": 0, "intra_anchor_cleanup": 0,
+                "symlinks_created": 0, "symlinks_skipped_existing": 0,
+                "bytes_moved": 1000, "bytes_reclaimed": 0, "unmatched_count": 0, "quarantined_error_count": 0
+            },
+            "anchor_batches": [],
+            "unmatched_files": [],
+            "quarantined_files": []
+        }))
+        .unwrap(),
+    )
+    .unwrap();
+
+    let entries = rusty_scanner::report_server::collect_run_hub_entries(&reports_root);
+    assert_eq!(entries.len(), 3);
+    assert_eq!(entries[0].status, "COMPLETED");
+    assert_eq!(
+        entries[1].status, "IN_PROGRESS",
+        "Active current-PID run must remain IN_PROGRESS (LIVE)"
+    );
+    assert_eq!(
+        entries[2].status, "INTERRUPTED",
+        "Dead-PID run must automatically reconcile to INTERRUPTED (STOPPED)"
+    );
+
+    // Verify dead run's `run_manifest.json` and `execution_report.html` were healed on disk too!
+    let healed: RunManifest =
+        serde_json::from_str(&fs::read_to_string(dead_dir.join("run_manifest.json")).unwrap())
+            .unwrap();
+    assert_eq!(healed.status, "INTERRUPTED");
+    let seqs: Vec<usize> = healed.anchor_batches.iter().map(|b| b.seq_id).collect();
+    assert_eq!(
+        seqs,
+        vec![1, 2, 3, 4, 5],
+        "Legacy 4100/4101/4102 seq_id jump must normalize to contiguous 1..=N!"
+    );
+    assert!(dead_dir.join("execution_report.html").is_file());
+
+    // Verify Hub HTML contains all 3 distinct status badge classes (`p-done`, `p-live`, `p-stop`)
+    let hub_resp = rusty_scanner::report_server::handle_http_request_in_memory(
+        b"GET / HTTP/1.1\r\nHost: localhost\r\n\r\n",
+        &reports_root,
+        5,
+    )
+    .unwrap();
+    let hub_html = String::from_utf8(hub_resp).unwrap();
+    assert!(hub_html.contains("p-stop"));
+    assert!(hub_html.contains("STOPPED"));
+
+    // 4. Verify >180 KB of matched file paths for a single anchor executes in ONE pass via `--inputs-from`
+    //    (zero chunk splitting into 100/101/102!)
+    let misc_pack = base.join("deep_misc_pack_folder_with_a_long_descriptive_directory_name/Miss Courtney");
+    let anc_courtney = base.join("Miss Courtney_h265");
+    let bins = base.join("bins");
+    fs::create_dir_all(&misc_pack).unwrap();
+    fs::create_dir_all(&anc_courtney).unwrap();
+    fs::create_dir_all(&bins).unwrap();
+
+    for idx in 0..1400 {
+        let p = misc_pack.join(format!("Miss Courtney - Episode {:04} Extended_h265.mp4", idx));
+        fs::write(&p, b"v").unwrap();
+    }
+
+    let mock_dedup = bins.join("rusty_dedup");
+    fs::write(
+        &mock_dedup,
+        r#"#!/usr/bin/env python3
+import json, sys
+if "--record-moves" in sys.argv:
+    sys.exit(0)
+assert "--inputs-from" in sys.argv, "Expected --inputs-from!"
+list_file = sys.argv[sys.argv.index("--inputs-from") + 1]
+with open(list_file, "r", encoding="utf-8") as f:
+    lines = [l.strip() for l in f if l.strip()]
+out = sys.argv[sys.argv.index("-o") + 1]
+with open(out, "w") as f:
+    json.dump({"input_directories": lines, "duplicates": []}, f)
+"#,
+    )
+    .unwrap();
+    fs::set_permissions(&mock_dedup, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let mock_clean = bins.join("rusty_clean");
+    fs::write(&mock_clean, "#!/bin/sh\nexit 0\n").unwrap();
+    fs::set_permissions(&mock_clean, fs::Permissions::from_mode(0o755)).unwrap();
+
+    let anchor_cfg = AnchorDirsConfig::from_yaml_str(
+        &format!("anchors:\n  \"{}\": {{}}\n", anc_courtney.display()),
+        Path::new("anchors.yaml"),
+    )
+    .unwrap();
+    let mut scanner_cfg = ScannerConfig::default();
+    scanner_cfg.reports.output_dir = base.join("single_pass_reports");
+    scanner_cfg.report_server.enabled = false;
+    let matcher = AnchorMatcher::new(&anchor_cfg.anchors, scanner_cfg.matching.clone());
+    let tools = ResolvedTools {
+        python_bin: PathBuf::from("python3"),
+        dedup_metrics_harness: None,
+        harness_linger_secs: None,
+        rusty_dedup_bin: mock_dedup,
+        rusty_clean_bin: mock_clean,
+        dedup_config: None,
+        decision_config: None,
+        states_dir: base.join(".states"),
+    };
+
+    let stats = run_live_loop(
+        std::slice::from_ref(&misc_pack),
+        &anchor_cfg,
+        &scanner_cfg,
+        &matcher,
+        &tools,
+        None,
+        &base.join("un.txt"),
+        false,
+    )
+    .unwrap();
+    assert_eq!(
+        stats.dedup_runs, 1,
+        "1,400 files (~200 KB of paths) must execute in 1 single rusty_dedup pass via --inputs-from!"
+    );
+    assert_eq!(stats.files_moved_directly, 1400);
+    let sp_manifest: RunManifest = serde_json::from_str(
+        &fs::read_to_string(stats.report_run_dir.join("run_manifest.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(sp_manifest.anchor_batches.len(), 1);
+    assert_eq!(sp_manifest.anchor_batches[0].seq_id, 1);
 
     let _ = fs::remove_dir_all(&base);
 }

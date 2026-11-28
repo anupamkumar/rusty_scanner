@@ -280,8 +280,10 @@ pub struct QuarantinedRecord {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct RunManifest {
     pub run_id: String,
+    #[serde(default)]
+    pub pid: u32,
     pub mode: String,
-    /// `"IN_PROGRESS"` while executing, `"COMPLETED"` upon completion
+    /// `"IN_PROGRESS"` while executing, `"COMPLETED"` upon completion, `"INTERRUPTED"` if stopped/killed
     pub status: String,
     pub started_at_utc: String,
     pub started_at_unix_ms: u64,
@@ -315,6 +317,10 @@ pub struct BatchReportPaths {
     pub pairs_rel_path: Option<String>,
     /// Ephemeral copy path passed to `rusty_clean` so `dedup_json_path` stays 100% unmodified.
     pub scratch_clean_input_path: PathBuf,
+    /// Ephemeral newline-delimited inputs list passed to `rusty_dedup --inputs-from` (eliminates ARG_MAX chunking).
+    pub scratch_inputs_list_path: PathBuf,
+    /// Ephemeral JSON move manifest passed to `rusty_dedup --record-moves`.
+    pub scratch_moves_json_path: PathBuf,
 }
 
 pub struct RunReportStore {
@@ -363,6 +369,7 @@ impl RunReportStore {
 
         let manifest = RunManifest {
             run_id,
+            pid,
             mode: mode.to_string(),
             status: "IN_PROGRESS".to_string(),
             started_at_utc: human_utc.clone(),
@@ -421,6 +428,12 @@ impl RunReportStore {
         let scratch_clean_input_path = self
             .clean_dir
             .join(format!(".scratch_input_{}.json", prefix));
+        let scratch_inputs_list_path = self
+            .clean_dir
+            .join(format!(".scratch_inputs_{}.txt", prefix));
+        let scratch_moves_json_path = self
+            .clean_dir
+            .join(format!(".scratch_moves_{}.json", prefix));
 
         BatchReportPaths {
             dedup_json_path: self.run_dir.join(&dedup_rel),
@@ -430,6 +443,8 @@ impl RunReportStore {
             pairs_json_path,
             pairs_rel_path,
             scratch_clean_input_path,
+            scratch_inputs_list_path,
+            scratch_moves_json_path,
         }
     }
 
@@ -446,6 +461,22 @@ impl RunReportStore {
             anchor_path: anchor_path.to_string_lossy().to_string(),
             reason: reason.to_string(),
         });
+    }
+
+    /// Marks the execution run `INTERRUPTED` (e.g. Ctrl-C / SIGTERM) and flushes final manifest + HTML.
+    pub fn mark_interrupted(
+        &mut self,
+        passes_executed: usize,
+        quarantined_error_count: usize,
+    ) -> Result<()> {
+        self.manifest.status = "INTERRUPTED".to_string();
+        self.recompute_totals();
+        if passes_executed > 0 {
+            self.manifest.totals.passes_executed = passes_executed;
+        }
+        self.manifest.totals.quarantined_error_count =
+            quarantined_error_count.max(self.manifest.quarantined_files.len());
+        self.flush_to_disk()
     }
 
     /// Marks the execution run `COMPLETED`, records final pass & unmatched counts, and writes final HTML.
@@ -837,6 +868,101 @@ pub fn correlate_duplicate_groups(
 // 5. Standalone `--build-report <RUN_DIR>` HTML Regeneration
 // ============================================================================
 
+/// Extracts the owning process ID from `manifest.pid` or trailing `run_<date>_<time>_<pid>`.
+pub fn extract_manifest_pid(manifest: &RunManifest) -> Option<u32> {
+    if manifest.pid > 0 {
+        return Some(manifest.pid);
+    }
+    parse_trailing_pid(&manifest.run_id)
+}
+
+fn parse_trailing_pid(run_id: &str) -> Option<u32> {
+    run_id
+        .rsplit('_')
+        .next()?
+        .parse::<u32>()
+        .ok()
+        .filter(|&p| p > 0)
+}
+
+/// Zero-subprocess PID liveness check via POSIX `kill(pid, 0)`.
+#[cfg(unix)]
+pub fn is_pid_alive_fast(pid: u32) -> bool {
+    if pid == 0 {
+        return false;
+    }
+    if pid == std::process::id() {
+        return true;
+    }
+    unsafe extern "C" {
+        fn kill(pid: i32, sig: i32) -> i32;
+    }
+    let rc = unsafe { kill(pid as i32, 0) };
+    if rc == 0 {
+        return true;
+    }
+    // EPERM (1) indicates the process is alive under a different UID; ESRCH (3) means exited.
+    std::io::Error::last_os_error().raw_os_error() == Some(1)
+}
+
+#[cfg(not(unix))]
+pub fn is_pid_alive_fast(pid: u32) -> bool {
+    pid == std::process::id()
+}
+
+/// Reconciles dead-PID `"IN_PROGRESS"` runs to `"INTERRUPTED"` and normalizes any legacy
+/// `seq_id * 100` jumps (`4100, 4101, 4102`) to contiguous `1..=N` execution order, persisting
+/// the healed `run_manifest.json` + `execution_report.html` atomically when changed.
+pub fn reconcile_and_persist_manifest(run_dir: &Path, manifest: &mut RunManifest) -> bool {
+    let mut changed = false;
+    if manifest.pid == 0 {
+        if let Some(parsed_pid) = parse_trailing_pid(&manifest.run_id) {
+            manifest.pid = parsed_pid;
+        }
+    }
+
+    if manifest.status == "IN_PROGRESS" {
+        if let Some(pid) = extract_manifest_pid(manifest) {
+            if !is_pid_alive_fast(pid) {
+                manifest.status = "INTERRUPTED".to_string();
+                changed = true;
+            }
+        }
+    }
+
+    if manifest
+        .anchor_batches
+        .iter()
+        .enumerate()
+        .any(|(idx, b)| b.seq_id != idx + 1)
+    {
+        for (idx, b) in manifest.anchor_batches.iter_mut().enumerate() {
+            b.seq_id = idx + 1;
+        }
+        changed = true;
+    }
+
+    if changed {
+        let manifest_path = run_dir.join("run_manifest.json");
+        if let Ok(json) = serde_json::to_string_pretty(manifest) {
+            let _ = write_file_atomic(&manifest_path, json.as_bytes());
+        }
+        let html_path = run_dir.join("execution_report.html");
+        let html = render_execution_report_html(manifest, "");
+        let _ = write_file_atomic(&html_path, html.as_bytes());
+    }
+
+    changed
+}
+
+/// Refreshes `latest_report.html` and `index.html` in `reports_root` to match `manifest`.
+pub fn refresh_latest_report_shortcuts(reports_root: &Path, manifest: &RunManifest) {
+    let prefix = format!("{}/", manifest.run_id);
+    let latest_html = render_execution_report_html(manifest, &prefix);
+    let _ = write_file_atomic(&reports_root.join("latest_report.html"), latest_html.as_bytes());
+    let _ = write_file_atomic(&reports_root.join("index.html"), latest_html.as_bytes());
+}
+
 /// Rebuilds `execution_report.html` (and updates `../latest_report.html` if inside a `reports/` parent)
 /// from an existing run directory — using `run_manifest.json` if present, or reconstructing directly
 /// from saved `dedup/*.json` and `clean/*.json` files!
@@ -847,7 +973,7 @@ pub fn rebuild_html_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
     let norm_run_dir = normalize_path_lexical(run_dir);
     let manifest_path = norm_run_dir.join("run_manifest.json");
 
-    let manifest: RunManifest = if manifest_path.is_file() {
+    let mut manifest: RunManifest = if manifest_path.is_file() {
         let raw = fs::read_to_string(&manifest_path)
             .with_context(|| format!("Failed to read {:?}", manifest_path))?;
         serde_json::from_str(&raw)
@@ -856,7 +982,8 @@ pub fn rebuild_html_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
         reconstruct_manifest_from_raw_jsons(&norm_run_dir)?
     };
 
-    if !manifest_path.is_file() {
+    let reconciled = reconcile_and_persist_manifest(&norm_run_dir, &mut manifest);
+    if !manifest_path.is_file() || reconciled {
         let json = serde_json::to_string_pretty(&manifest)?;
         write_file_atomic(&manifest_path, json.as_bytes())?;
     }
@@ -874,9 +1001,23 @@ pub fn rebuild_html_from_run_dir(run_dir: &Path) -> Result<PathBuf> {
                 .map(|n| n.contains("report"))
                 .unwrap_or(false)
         {
-            let prefix = format!("{}/", manifest.run_id);
-            let latest_html = render_execution_report_html(&manifest, &prefix);
-            let _ = write_file_atomic(&latest_cand, latest_html.as_bytes());
+            // Only overwrite `latest_report.html` / `index.html` if this run is the newest run in `parent`
+            let is_newest = fs::read_dir(parent)
+                .ok()
+                .map(|rd| {
+                    let mut run_names: Vec<String> = rd
+                        .filter_map(|e| e.ok())
+                        .filter(|e| e.path().is_dir())
+                        .map(|e| e.file_name().to_string_lossy().to_string())
+                        .filter(|n| n.starts_with("run_"))
+                        .collect();
+                    run_names.sort();
+                    run_names.last().map(|s| s.as_str()) == Some(manifest.run_id.as_str())
+                })
+                .unwrap_or(true);
+            if is_newest {
+                refresh_latest_report_shortcuts(parent, &manifest);
+            }
         }
     }
 
@@ -1025,8 +1166,10 @@ fn reconstruct_manifest_from_raw_jsons(run_dir: &Path) -> Result<RunManifest> {
 
     totals.passes_executed = if anchor_batches.is_empty() { 0 } else { 1 };
 
+    let pid = parse_trailing_pid(&run_id).unwrap_or(0);
     Ok(RunManifest {
         run_id,
+        pid,
         mode: "REBUILT_FROM_JSON".to_string(),
         status: "COMPLETED".to_string(),
         started_at_utc: human_utc.clone(),
@@ -1274,6 +1417,7 @@ body {
 }
 .status-completed { background: var(--emerald-soft); color: var(--emerald); border: 1px solid var(--emerald); }
 .status-progress { background: var(--amber-soft); color: var(--amber); border: 1px solid var(--amber); }
+.status-stopped { background: var(--red-soft); color: var(--red); border: 1px solid var(--red); }
 
 .btn {
   background: var(--bg-elevated);
@@ -1726,11 +1870,26 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
     }
   }
 
+  function normalizeManifestBatches() {
+    (MANIFEST.anchor_batches || []).forEach((b, idx) => {
+      b._exec_order = idx + 1;
+    });
+  }
+  normalizeManifestBatches();
+
   function renderHeader() {
     const pill = document.getElementById('run-status-pill');
-    const isDone = MANIFEST.status === 'COMPLETED';
-    pill.textContent = isDone ? 'COMPLETED' : 'LIVE / IN PROGRESS';
-    pill.className = 'status-pill ' + (isDone ? 'status-completed' : 'status-progress');
+    const st = MANIFEST.status || 'COMPLETED';
+    if (st === 'COMPLETED') {
+      pill.textContent = 'COMPLETED';
+      pill.className = 'status-pill status-completed';
+    } else if (st === 'IN_PROGRESS') {
+      pill.textContent = 'LIVE / IN PROGRESS';
+      pill.className = 'status-pill status-progress';
+    } else {
+      pill.textContent = 'STOPPED';
+      pill.className = 'status-pill status-stopped';
+    }
 
     let localStart = MANIFEST.started_at_utc || '';
     if (MANIFEST.started_at_unix_ms) {
@@ -1872,25 +2031,31 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
     }
   }
 
+  function batchOrder(b) {
+    return b._exec_order || b.seq_id || 0;
+  }
+
   function sortBatches(list) {
     const mode = state.sort;
     return list.slice().sort((a, b) => {
+      const oa = batchOrder(a);
+      const ob = batchOrder(b);
       if (mode === 'reclaimed_desc') {
-        return (b.bytes_reclaimed - a.bytes_reclaimed) || ((b.duplicate_groups || []).length - (a.duplicate_groups || []).length) || (a.seq_id - b.seq_id);
+        return (b.bytes_reclaimed - a.bytes_reclaimed) || ((b.duplicate_groups || []).length - (a.duplicate_groups || []).length) || (oa - ob);
       }
       if (mode === 'upgrades_desc') {
-        return ((b.anchor_upgrades_count || 0) - (a.anchor_upgrades_count || 0)) || (b.bytes_reclaimed - a.bytes_reclaimed) || (a.seq_id - b.seq_id);
+        return ((b.anchor_upgrades_count || 0) - (a.anchor_upgrades_count || 0)) || (b.bytes_reclaimed - a.bytes_reclaimed) || (oa - ob);
       }
       if (mode === 'dups_desc') {
-        return ((b.duplicate_groups || []).length - (a.duplicate_groups || []).length) || (b.bytes_reclaimed - a.bytes_reclaimed) || (a.seq_id - b.seq_id);
+        return ((b.duplicate_groups || []).length - (a.duplicate_groups || []).length) || (b.bytes_reclaimed - a.bytes_reclaimed) || (oa - ob);
       }
       if (mode === 'moved_desc') {
-        return ((b.direct_moves || []).length - (a.direct_moves || []).length) || (b.bytes_moved - a.bytes_moved) || (a.seq_id - b.seq_id);
+        return ((b.direct_moves || []).length - (a.direct_moves || []).length) || (b.bytes_moved - a.bytes_moved) || (oa - ob);
       }
       if (mode === 'name_asc') {
-        return String(a.anchor_name || '').localeCompare(String(b.anchor_name || '')) || (a.seq_id - b.seq_id);
+        return String(a.anchor_name || '').localeCompare(String(b.anchor_name || '')) || (oa - ob);
       }
-      return a.seq_id - b.seq_id;
+      return oa - ob;
     });
   }
 
@@ -2016,11 +2181,12 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
   }
 
   function renderAnchorBody(b) {
+    const ord = batchOrder(b);
     const dupCount = (b.duplicate_groups || []).length;
     const moveCount = (b.direct_moves || []).length;
     const symCount = (b.symlinks_created || []).length;
     const defaultTab = dupCount > 0 ? 'dups' : (moveCount > 0 ? 'moves' : 'symlinks');
-    const activeTab = state.activeTabBySeq.get(b.seq_id) || defaultTab;
+    const activeTab = state.activeTabBySeq.get(ord) || defaultTab;
 
     let errBanner = '';
     if (b.errors && b.errors.length) {
@@ -2035,9 +2201,9 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
 
     return errBanner +
       '<div class="tabs">' +
-        '<button type="button" class="tab-btn' + (activeTab === 'dups' ? ' active' : '') + '" data-seq="' + b.seq_id + '" data-tab="dups">Duplicate Groups (' + dupCount + ')</button>' +
-        '<button type="button" class="tab-btn' + (activeTab === 'moves' ? ' active' : '') + '" data-seq="' + b.seq_id + '" data-tab="moves">New Videos Moved (' + moveCount + ')</button>' +
-        '<button type="button" class="tab-btn' + (activeTab === 'symlinks' ? ' active' : '') + '" data-seq="' + b.seq_id + '" data-tab="symlinks">Rank #2–#4 Symlinks (' + symCount + ')</button>' +
+        '<button type="button" class="tab-btn' + (activeTab === 'dups' ? ' active' : '') + '" data-seq="' + ord + '" data-tab="dups">Duplicate Groups (' + dupCount + ')</button>' +
+        '<button type="button" class="tab-btn' + (activeTab === 'moves' ? ' active' : '') + '" data-seq="' + ord + '" data-tab="moves">New Videos Moved (' + moveCount + ')</button>' +
+        '<button type="button" class="tab-btn' + (activeTab === 'symlinks' ? ' active' : '') + '" data-seq="' + ord + '" data-tab="symlinks">Rank #2–#4 Symlinks (' + symCount + ')</button>' +
       '</div>' +
       '<div class="tab-panel">' + contentHtml + '</div>';
   }
@@ -2057,7 +2223,8 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
     }
 
     container.innerHTML = filtered.map(b => {
-      const isOpen = state.openSeqs.has(b.seq_id) || (q.length > 0 && filtered.length <= 12);
+      const ord = batchOrder(b);
+      const isOpen = state.openSeqs.has(ord) || (q.length > 0 && filtered.length <= 12);
       const dupCount = (b.duplicate_groups || []).length;
       const moveCount = (b.direct_moves || []).length;
       const symCount = (b.symlinks_created || []).length;
@@ -2065,6 +2232,7 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
       const customDest = (b.destination_path && b.destination_path !== b.anchor_path)
         ? '  →  dest: ' + b.destination_path
         : '';
+      const chunkSuffix = b.chunk_idx > 0 ? (' • Part ' + (b.chunk_idx + 1)) : '';
 
       const badges = [];
       if (moveCount > 0) badges.push('<span class="badge b-move">+' + moveCount + ' Moved (' + esc(fmtBytes(b.bytes_moved)) + ')</span>');
@@ -2086,11 +2254,11 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
         linksHtml += '<a class="json-link" href="' + esc(pairsHref) + '" target="_blank" rel="noopener" onclick="event.stopPropagation();">pairs.json</a>';
       }
 
-      return '<div class="anchor-card' + (isOpen ? ' open' : '') + '" data-card-seq="' + b.seq_id + '">' +
-        '<div class="anchor-header" data-hdr-seq="' + b.seq_id + '">' +
+      return '<div class="anchor-card' + (isOpen ? ' open' : '') + '" data-card-seq="' + ord + '">' +
+        '<div class="anchor-header" data-hdr-seq="' + ord + '">' +
           '<div class="anchor-left">' +
             '<span class="chevron">▶</span>' +
-            '<span class="seq-badge">#' + b.seq_id + ' • P' + b.pass_num + '</span>' +
+            '<span class="seq-badge">#' + ord + ' • P' + b.pass_num + chunkSuffix + '</span>' +
             '<div class="anchor-title-wrap">' +
               '<div class="anchor-name">' + esc(b.anchor_name) + '</div>' +
               '<div class="anchor-path">' + esc(b.anchor_path + customDest) + '</div>' +
@@ -2109,7 +2277,7 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
   }
 
   function bindAnchorEvents(batches) {
-    const bySeq = new Map(batches.map(b => [b.seq_id, b]));
+    const bySeq = new Map(batches.map(b => [batchOrder(b), b]));
     document.querySelectorAll('[data-hdr-seq]').forEach(hdr => {
       hdr.addEventListener('click', () => {
         const seq = Number(hdr.getAttribute('data-hdr-seq'));
@@ -2201,7 +2369,7 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
     renderAnchors();
   });
   document.getElementById('btn-expand-all').addEventListener('click', () => {
-    (MANIFEST.anchor_batches || []).forEach(b => state.openSeqs.add(b.seq_id));
+    (MANIFEST.anchor_batches || []).forEach(b => state.openSeqs.add(batchOrder(b)));
     renderAnchors();
   });
   document.getElementById('btn-collapse-all').addEventListener('click', () => {
@@ -2216,8 +2384,8 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
   // Auto-open first anchor with duplicates (or first anchor if <= 3 total) for instant insight
   const batches = MANIFEST.anchor_batches || [];
   const firstWithDup = batches.find(b => (b.duplicate_groups || []).length > 0);
-  if (firstWithDup) state.openSeqs.add(firstWithDup.seq_id);
-  else if (batches.length > 0 && batches.length <= 3) state.openSeqs.add(batches[0].seq_id);
+  if (firstWithDup) state.openSeqs.add(batchOrder(firstWithDup));
+  else if (batches.length > 0 && batches.length <= 3) state.openSeqs.add(batchOrder(batches[0]));
 
   renderHeader();
   renderFilterPills();
@@ -2234,11 +2402,17 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
   const pollSecs = Number(MANIFEST.live_refresh_secs || 0);
   const pollBtn = document.getElementById('btn-live-poll');
 
+  function isManifestActive() {
+    return MANIFEST.status === 'IN_PROGRESS';
+  }
+
   function updatePollButton() {
     if (!pollBtn || pollSecs <= 0) return;
-    if (MANIFEST.status === 'COMPLETED' && !state.forceKeepPolling) {
+    if (!isManifestActive() && !state.forceKeepPolling) {
       pollBtn.style.display = 'inline-block';
-      pollBtn.textContent = '⟳ Auto-Refresh: Done (Click to Watch)';
+      pollBtn.textContent = MANIFEST.status === 'COMPLETED'
+        ? '⟳ Auto-Refresh: Done (Click to Watch)'
+        : '⟳ Auto-Refresh: Stopped (Click to Watch)';
       pollBtn.classList.remove('active');
       return;
     }
@@ -2251,7 +2425,7 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
 
   async function refreshReportTick() {
     if (!state.livePollEnabled) return;
-    if (MANIFEST.status === 'COMPLETED' && !state.forceKeepPolling) return;
+    if (!isManifestActive() && !state.forceKeepPolling) return;
 
     if (IS_HTTP) {
       try {
@@ -2260,6 +2434,7 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
           const fresh = await res.json();
           if (fresh && fresh.run_id === MANIFEST.run_id) {
             MANIFEST = fresh;
+            normalizeManifestBatches();
             renderHeader();
             renderFilterPills();
             renderKpis();
@@ -2278,7 +2453,7 @@ const HTML_TEMPLATE_SCRIPT_AND_END: &str = r#"
   if (pollSecs > 0 && pollBtn) {
     updatePollButton();
     pollBtn.addEventListener('click', () => {
-      if (MANIFEST.status === 'COMPLETED' && !state.forceKeepPolling) {
+      if (!isManifestActive() && !state.forceKeepPolling) {
         state.forceKeepPolling = true;
         state.livePollEnabled = true;
       } else {

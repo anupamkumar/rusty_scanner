@@ -334,6 +334,8 @@ fn live_orchestrator_handles_direct_moves_temp_parking_clean_symlinks_and_unmatc
 import json, sys, os
 
 out_path = "duplicates.json"
+states_dir = ".states"
+record_moves_path = None
 inputs = []
 i = 1
 while i < len(sys.argv):
@@ -341,7 +343,20 @@ while i < len(sys.argv):
     if a in ("-o", "--output"):
         out_path = sys.argv[i + 1]
         i += 2
-    elif a in ("-c", "--dedup-config", "--config", "--states-dir"):
+    elif a == "--states-dir":
+        states_dir = sys.argv[i + 1]
+        i += 2
+    elif a == "--inputs-from":
+        with open(sys.argv[i + 1], "r", encoding="utf-8") as lf:
+            for line in lf:
+                s = line.strip()
+                if s:
+                    inputs.append(s)
+        i += 2
+    elif a == "--record-moves":
+        record_moves_path = sys.argv[i + 1]
+        i += 2
+    elif a in ("-c", "--dedup-config", "--config", "--categories-log"):
         i += 2
     elif a.startswith("-"):
         i += 1
@@ -349,7 +364,17 @@ while i < len(sys.argv):
         inputs.append(a)
         i += 1
 
-# Verify misc directory itself was NOT passed — only anchor dir + individual matched files!
+if record_moves_path is not None:
+    os.makedirs(states_dir, exist_ok=True)
+    with open(record_moves_path, "r", encoding="utf-8") as mf:
+        moves = json.load(mf)
+    assert isinstance(moves, list) and len(moves) >= 1
+    with open(os.path.join(states_dir, "recorded_moves.jsonl"), "a", encoding="utf-8") as out_f:
+        for m in moves:
+            out_f.write(json.dumps(m) + "\n")
+    sys.exit(0)
+
+# Verify misc directory itself was NOT passed — only anchor dir + individual matched files via --inputs-from!
 # AND verify rusty_dedup was launched UNDER rusty_dedup_metrics_harness.py!
 assert os.environ.get("RUSTY_DEDUP_HARNESS_ACTIVE") == "1", "Expected RUSTY_DEDUP_HARNESS_ACTIVE=1 from Python metrics harness!"
 assert os.environ.get("RUSTY_DEDUP_TELEMETRY_SNAPSHOT"), "Expected RUSTY_DEDUP_TELEMETRY_SNAPSHOT from Python metrics harness!"
@@ -394,7 +419,7 @@ while i < len(sys.argv):
     elif a in ("-o", "--report-out"):
         report_out = sys.argv[i + 1]
         i += 2
-    elif a in ("-c", "--decision-config"):
+    elif a in ("-c", "--decision-config", "--states-dir"):
         i += 2
     else:
         i += 1
@@ -547,6 +572,10 @@ anchors:
     // 7. `misc_files.txt` lists ONLY `mystery_clip_999.avi`
     let unmatched_txt = fs::read_to_string(&unmatched_out).unwrap();
     assert_eq!(unmatched_txt.trim(), m_unmatched.to_string_lossy());
+
+    // 8. `--record-moves` recorded the direct move into `.states/recorded_moves.jsonl`
+    let rec_moves_txt = fs::read_to_string(base.join(".states").join("recorded_moves.jsonl")).unwrap();
+    assert!(rec_moves_txt.contains("CreatorTwo - BrandNewClip.mp4"));
 
     let _ = fs::remove_dir_all(&base);
 }

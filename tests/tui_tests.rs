@@ -248,7 +248,7 @@ fn execute_from_csv_runs_end_to_end_pipeline() {
     let mock_dedup = mock_bins.join("rusty_dedup");
     fs::write(
         &mock_dedup,
-        "#!/usr/bin/env python3\nimport json, sys\nout = sys.argv[sys.argv.index('-o') + 1]\nwith open(out, 'w') as f:\n    json.dump({'duplicates': []}, f)\n",
+        "#!/usr/bin/env python3\nimport json, sys\nif '--record-moves' in sys.argv:\n    sys.exit(0)\nout = sys.argv[sys.argv.index('-o') + 1]\nwith open(out, 'w') as f:\n    json.dump({'duplicates': []}, f)\n",
     )
     .unwrap();
     fs::set_permissions(&mock_dedup, fs::Permissions::from_mode(0o755)).unwrap();

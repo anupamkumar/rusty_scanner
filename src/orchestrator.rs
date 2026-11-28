@@ -5,7 +5,7 @@ use crate::config::{
 use crate::csv_report::{print_match_summary, write_matches_csv, write_unmatched_files};
 use crate::html_report::{
     AnchorBatchAudit, CleanGroupDecision, DedupReportFull, MovedVideoRecord, PairEvaluationEntry,
-    RunReportStore, SymlinkRecord, correlate_duplicate_groups,
+    RunReportStore, SymlinkRecord, correlate_duplicate_groups, is_pid_alive_fast,
 };
 use crate::matcher::{AnchorMatcher, FileMatchResult, PlannedAction};
 use crate::report_server::BackgroundReportServer;
@@ -19,15 +19,39 @@ use std::io::{Read, Write};
 use std::os::unix::fs::symlink;
 use std::path::{Path, PathBuf};
 use std::process::Command;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::time::Instant;
 use walkdir::WalkDir;
 
 /// Chunk size (4 MiB) for cross-volume file moves (matching `rusty_clean`).
 const MOVE_COPY_CHUNK_SIZE: usize = 4 * 1024 * 1024;
 
-/// Maximum command-line payload bytes per `rusty_dedup` invocation before splitting into sub-batches
-/// (stays comfortably below macOS `ARG_MAX` of 262,144 bytes and Linux/Windows limits).
-const MAX_DEDUP_CLI_ARG_BYTES: usize = 120 * 1024;
+static SHUTDOWN_REQUESTED: AtomicBool = AtomicBool::new(false);
+
+#[cfg(unix)]
+extern "C" fn handle_termination_signal(_sig: i32) {
+    SHUTDOWN_REQUESTED.store(true, Ordering::SeqCst);
+}
+
+fn install_signal_handlers() {
+    SHUTDOWN_REQUESTED.store(false, Ordering::SeqCst);
+    #[cfg(unix)]
+    unsafe {
+        unsafe extern "C" {
+            fn signal(sig: i32, handler: extern "C" fn(i32)) -> usize;
+        }
+        const SIGHUP: i32 = 1;
+        const SIGINT: i32 = 2;
+        const SIGTERM: i32 = 15;
+        let _ = signal(SIGHUP, handle_termination_signal);
+        let _ = signal(SIGINT, handle_termination_signal);
+        let _ = signal(SIGTERM, handle_termination_signal);
+    }
+}
+
+fn is_shutdown_requested() -> bool {
+    SHUTDOWN_REQUESTED.load(Ordering::SeqCst)
+}
 
 const HOLD_MANIFEST_FILENAME: &str = "hold_manifest.json";
 
@@ -355,7 +379,7 @@ pub fn recover_stranded_temp_holds(inputs: &[PathBuf], anchors: &[AnchorEntry], 
                 continue;
             }
             // Check if the owning PID is no longer alive
-            if is_pid_alive(manifest.pid) {
+            if is_pid_alive_fast(manifest.pid) {
                 continue;
             }
             eprintln!(
@@ -390,22 +414,6 @@ pub fn recover_stranded_temp_holds(inputs: &[PathBuf], anchors: &[AnchorEntry], 
             }
         }
     }
-}
-
-#[cfg(unix)]
-fn is_pid_alive(pid: u32) -> bool {
-    // Check via `kill -0 <pid>` command or `/proc`? No — avoid spawning subprocesses unnecessarily;
-    // `Command::new("kill").args(["-0", &pid.to_string()])` runs once only if a stranded folder exists!
-    Command::new("kill")
-        .args(["-0", &pid.to_string()])
-        .output()
-        .map(|o| o.status.success())
-        .unwrap_or(false)
-}
-
-#[cfg(not(unix))]
-fn is_pid_alive(_pid: u32) -> bool {
-    false
 }
 
 /// Statistics accumulated across all live convergence passes.
@@ -447,6 +455,7 @@ pub fn run_live_loop(
     verbose: bool,
 ) -> Result<LiveExecutionStats> {
     let global_start = Instant::now();
+    install_signal_handlers();
     recover_stranded_temp_holds(inputs, &anchor_cfg.anchors, verbose);
 
     let mut report_store = RunReportStore::init(
@@ -479,10 +488,13 @@ pub fn run_live_loop(
         ..LiveExecutionStats::default()
     };
     let mut quarantined_paths: HashSet<PathBuf> = HashSet::new();
-    let final_unmatched_paths: Vec<PathBuf>;
+    let mut final_unmatched_paths: Vec<PathBuf> = Vec::new();
     let mut seq_counter: usize = 0;
 
-    loop {
+    'pass_loop: loop {
+        if is_shutdown_requested() {
+            break 'pass_loop;
+        }
         let pass_num = stats.passes_executed + 1;
         let is_first_pass = pass_num == 1;
 
@@ -548,6 +560,9 @@ pub fn run_live_loop(
         let mut progressed_in_pass = 0usize;
 
         for (anchor_idx, group_files) in by_primary_anchor {
+            if is_shutdown_requested() {
+                break 'pass_loop;
+            }
             let anchor = &anchor_cfg.anchors[anchor_idx];
 
             // Filter to files that still exist right now (defensive check)
@@ -611,6 +626,13 @@ pub fn run_live_loop(
                     }
                 }
                 Err(e) => {
+                    if is_shutdown_requested() {
+                        eprintln!(
+                            "\n[Interrupted] Signal received while processing anchor {:?}; stopping cleanly...",
+                            anchor.anchor_path
+                        );
+                        break 'pass_loop;
+                    }
                     let err_str = format!("{:#}", e);
                     eprintln!(
                         "! ERROR processing anchor {:?}: {}",
@@ -656,6 +678,21 @@ pub fn run_live_loop(
                 write_unmatched_files(&final_outcome.unmatched_files, unmatched_out)?;
             break;
         }
+    }
+
+    if is_shutdown_requested() {
+        eprintln!(
+            "\n[Interrupted] Marking run {} as INTERRUPTED (STOPPED) in report manifest...",
+            report_store.manifest.run_id
+        );
+        report_store.mark_interrupted(stats.passes_executed, stats.quarantined_errors)?;
+        stats.bytes_moved = report_store.manifest.totals.bytes_moved;
+        stats.bytes_reclaimed = report_store.manifest.totals.bytes_reclaimed;
+        stats.anchor_upgrades = report_store.manifest.totals.anchor_upgrades;
+        if let Some(ref mut srv) = bg_server {
+            srv.stop();
+        }
+        return Ok(stats);
     }
 
     report_store.finalize(
@@ -735,6 +772,7 @@ pub fn execute_matched_files(
     verbose: bool,
 ) -> Result<LiveExecutionStats> {
     let global_start = Instant::now();
+    install_signal_handlers();
     let input_paths: Vec<PathBuf> = matched_files
         .iter()
         .map(|m| m.candidate.path.clone())
@@ -784,6 +822,9 @@ pub fn execute_matched_files(
 
     let mut seq_counter = 0usize;
     for (anchor_idx, group_files) in by_primary_anchor {
+        if is_shutdown_requested() {
+            break;
+        }
         let anchor = &anchor_cfg.anchors[anchor_idx];
         let active_files: Vec<FileMatchResult> = group_files
             .into_iter()
@@ -835,6 +876,13 @@ pub fn execute_matched_files(
                 }
             }
             Err(e) => {
+                if is_shutdown_requested() {
+                    eprintln!(
+                        "\n[Interrupted] Signal received while processing anchor {:?}; stopping cleanly...",
+                        anchor.anchor_path
+                    );
+                    break;
+                }
                 let err_str = format!("{:#}", e);
                 eprintln!(
                     "! ERROR processing anchor {:?}: {}",
@@ -852,6 +900,21 @@ pub fn execute_matched_files(
                 }
             }
         }
+    }
+
+    if is_shutdown_requested() {
+        eprintln!(
+            "\n[Interrupted] Marking curated run {} as INTERRUPTED (STOPPED) in report manifest...",
+            report_store.manifest.run_id
+        );
+        report_store.mark_interrupted(1, stats.quarantined_errors)?;
+        stats.bytes_moved = report_store.manifest.totals.bytes_moved;
+        stats.bytes_reclaimed = report_store.manifest.totals.bytes_reclaimed;
+        stats.anchor_upgrades = report_store.manifest.totals.anchor_upgrades;
+        if let Some(ref mut srv) = bg_server {
+            srv.stop();
+        }
+        return Ok(stats);
     }
 
     report_store.finalize(1, &[], stats.quarantined_errors)?;
@@ -911,18 +974,20 @@ pub fn execute_matched_files(
     Ok(stats)
 }
 
-/// Processes a single Rank #1 anchor batch across sub-chunks if needed:
-/// 1. Runs `rusty_dedup <anchor_root> <file1> <file2> ... -o reports/run_.../dedup/<seq>_..._dups.json`
-/// 2. If `dups.json` has NO duplicates -> moves matched files directly to `<destination>`
+/// Processes a single Rank #1 anchor batch in one unified pass via `rusty_dedup --inputs-from`:
+/// 1. Writes `<anchor_root>\n<file1>\n...` to a scratch list and runs `rusty_dedup --inputs-from`
+///    writing directly to persistent `reports/run_.../dedup/<seq>_..._dups.json` (zero ARG_MAX splitting!)
+/// 2. If `dups.json` has NO duplicates -> moves matched files directly to `<destination>` (preserving mtime)
+///    and updates their paths inside `<states_dir>/rusty_video_cache.db` via `--record-moves`
 /// 3. If `dups.json` HAS duplicates -> parks unrelated non-dups outside `misc_dir` (and `<anchor_root>`
-///    if custom `destination`), runs `rusty_clean <scratch_dups.json> -t <destination> -o reports/run_.../clean/<seq>_..._clean.json`,
+///    if custom `destination`), runs `rusty_clean <scratch_dups.json> -t <destination> --states-dir <states_dir> -o reports/run_.../clean/<seq>_..._clean.json`,
 ///    and restores parked files (preserving both raw `dups.json` and `clean.json` permanently!)
 /// 4. Creates softlinks in Rank #2, #3, #4 anchors' `<destination>` pointing to the surviving file
-/// 5. Appends `AnchorBatchAudit` and incrementally updates `run_manifest.json` + `execution_report.html`
+/// 5. Appends `AnchorBatchAudit` (`seq_id = 1..N`) and incrementally updates `run_manifest.json` + `execution_report.html`
 #[allow(clippy::too_many_arguments)]
 fn process_single_anchor_group(
     anchor: &AnchorEntry,
-    active_files: &[FileMatchResult],
+    batch: &[FileMatchResult],
     scanner_cfg: &ScannerConfig,
     tools: &ResolvedTools,
     report_store: &mut RunReportStore,
@@ -938,471 +1003,499 @@ fn process_single_anchor_group(
         )
     })?;
 
-    let sub_batches = split_into_cli_safe_batches(active_files);
     let mut progressed = 0usize;
+    let chunk_idx = 0usize;
+    let chunk_start = Instant::now();
+    eprintln!(
+        "  [Anchor {:?} -> dest {:?}] Checking {} matched file(s) with rusty_dedup...",
+        anchor.anchor_path,
+        anchor.destination_path,
+        batch.len()
+    );
 
-    for (chunk_idx, batch) in sub_batches.iter().enumerate() {
-        let chunk_start = Instant::now();
-        eprintln!(
-            "  [Anchor {:?} -> dest {:?}] Checking {} matched file(s) with rusty_dedup...",
-            anchor.anchor_path,
-            anchor.destination_path,
-            batch.len()
-        );
+    let bpaths = report_store.prepare_batch_paths(pass_num, seq_id, chunk_idx, anchor);
 
-        let bpaths = report_store.prepare_batch_paths(pass_num, seq_id, chunk_idx, anchor);
-
-        // ---------------------------------------------------------------------
-        // Step 1: Invoke `rusty_dedup <anchor_root> <matched_file_1> ...`
-        //         writing directly to persistent `reports/run_<id>/dedup/..._dups.json`
-        // ---------------------------------------------------------------------
-        run_rusty_dedup_command(
-            anchor,
-            batch,
-            tools,
-            &bpaths.dedup_json_path,
-            bpaths.pairs_json_path.as_deref(),
-            verbose,
-        )?;
-        stats.dedup_runs += 1;
-
-        let dups_raw = fs::read_to_string(&bpaths.dedup_json_path).with_context(|| {
+    // ---------------------------------------------------------------------
+    // Step 1: Write `<anchor_root>\n<matched_file_1>\n...` and invoke `rusty_dedup --inputs-from`
+    //         writing directly to persistent `reports/run_<id>/dedup/..._dups.json`
+    // ---------------------------------------------------------------------
+    {
+        let mut list_buf = String::with_capacity((batch.len() + 1) * 96);
+        list_buf.push_str(&anchor.anchor_path.to_string_lossy());
+        list_buf.push('\n');
+        for item in batch {
+            list_buf.push_str(&item.candidate.path.to_string_lossy());
+            list_buf.push('\n');
+        }
+        fs::write(&bpaths.scratch_inputs_list_path, list_buf.as_bytes()).with_context(|| {
             format!(
-                "Failed to read rusty_dedup output JSON at {:?}",
-                bpaths.dedup_json_path
+                "Failed to write scratch inputs list {:?}",
+                bpaths.scratch_inputs_list_path
             )
         })?;
-        let dedup_report: DedupReportFull =
-            serde_json::from_str(&dups_raw).with_context(|| {
-                format!(
-                    "Failed to parse rusty_dedup output JSON at {:?}",
-                    bpaths.dedup_json_path
-                )
-            })?;
+    }
 
-        let pairs_rel_used = bpaths
-            .pairs_json_path
-            .as_ref()
-            .filter(|p| p.is_file())
-            .and_then(|_| bpaths.pairs_rel_path.clone());
+    let dedup_res = run_rusty_dedup_command(
+        anchor,
+        &bpaths.scratch_inputs_list_path,
+        tools,
+        &bpaths.dedup_json_path,
+        bpaths.pairs_json_path.as_deref(),
+        verbose,
+    );
+    let _ = fs::remove_file(&bpaths.scratch_inputs_list_path);
+    dedup_res?;
+    stats.dedup_runs += 1;
 
-        // Map each original misc file index -> surviving final winner path in Rank #1
-        let mut surviving_winner_by_idx: HashMap<usize, PathBuf> =
-            HashMap::with_capacity(batch.len());
-        let mut direct_moves_audit: Vec<MovedVideoRecord> = Vec::new();
-        let mut dup_groups_audit = Vec::new();
-        let mut clean_rel_used: Option<String> = None;
-        let mut batch_bytes_moved = 0u64;
-        let mut batch_bytes_reclaimed = 0u64;
-        let mut batch_dups_deleted = 0usize;
-        let mut batch_upgrades = 0usize;
+    let dups_raw = fs::read_to_string(&bpaths.dedup_json_path).with_context(|| {
+        format!(
+            "Failed to read rusty_dedup output JSON at {:?}",
+            bpaths.dedup_json_path
+        )
+    })?;
+    let dedup_report: DedupReportFull = serde_json::from_str(&dups_raw).with_context(|| {
+        format!(
+            "Failed to parse rusty_dedup output JSON at {:?}",
+            bpaths.dedup_json_path
+        )
+    })?;
 
-        if dedup_report.duplicates.is_empty() {
-            // -----------------------------------------------------------------
-            // Step 2A: Zero duplicates -> Move (NEVER copy) directly to `<destination>`
-            // -----------------------------------------------------------------
-            eprintln!(
-                "  [Anchor {:?}] rusty_dedup found 0 duplicates; moving {} file(s) directly to {:?}...",
-                anchor.anchor_path,
-                batch.len(),
-                anchor.destination_path
+    let pairs_rel_used = bpaths
+        .pairs_json_path
+        .as_ref()
+        .filter(|p| p.is_file())
+        .and_then(|_| bpaths.pairs_rel_path.clone());
+
+    // Map each original misc file index -> surviving final winner path in Rank #1
+    let mut surviving_winner_by_idx: HashMap<usize, PathBuf> =
+        HashMap::with_capacity(batch.len());
+    let mut direct_moves_audit: Vec<MovedVideoRecord> = Vec::new();
+    let mut dup_groups_audit = Vec::new();
+    let mut clean_rel_used: Option<String> = None;
+    let mut batch_bytes_moved = 0u64;
+    let mut batch_bytes_reclaimed = 0u64;
+    let mut batch_dups_deleted = 0usize;
+    let mut batch_upgrades = 0usize;
+
+    if dedup_report.duplicates.is_empty() {
+        // -----------------------------------------------------------------
+        // Step 2A: Zero duplicates -> Move (NEVER copy) directly to `<destination>`
+        // -----------------------------------------------------------------
+        eprintln!(
+            "  [Anchor {:?}] rusty_dedup found 0 duplicates; moving {} file(s) directly to {:?}...",
+            anchor.anchor_path,
+            batch.len(),
+            anchor.destination_path
+        );
+
+        let mut reserved_dest_paths: HashSet<PathBuf> = HashSet::new();
+        for (i, item) in batch.iter().enumerate() {
+            let src = &item.candidate.path;
+            if !src.exists() {
+                continue;
+            }
+            let dest = compute_unique_destination(
+                src,
+                &anchor.destination_path,
+                &mut reserved_dest_paths,
             );
+            let moved_sz = move_file_never_copy(
+                src,
+                &dest,
+                item.candidate.size_bytes,
+                i + 1,
+                batch.len(),
+                verbose,
+            )?;
+            let pm = item.matches.first();
+            direct_moves_audit.push(MovedVideoRecord {
+                source_path: src.to_string_lossy().to_string(),
+                dest_path: dest.to_string_lossy().to_string(),
+                size_bytes: moved_sz,
+                matched_alias: pm.map(|m| m.matched_alias.clone()).unwrap_or_default(),
+                match_tier: pm
+                    .map(|m| m.match_tier.as_str().to_string())
+                    .unwrap_or_default(),
+                confidence_score: pm.map(|m| m.confidence_score).unwrap_or(0.0),
+                move_kind: "DIRECT_NO_DUP".to_string(),
+            });
+            batch_bytes_moved += moved_sz;
+            surviving_winner_by_idx.insert(i, dest);
+            stats.files_moved_directly += 1;
+            progressed += 1;
+        }
 
-            let mut reserved_dest_paths: HashSet<PathBuf> = HashSet::new();
-            for (i, item) in batch.iter().enumerate() {
-                let src = &item.candidate.path;
-                if !src.exists() {
+        // Sync direct moves into `<states_dir>/rusty_video_cache.db` so future passes hit SQLite in 0ms!
+        if !direct_moves_audit.is_empty() {
+            let move_specs: Vec<serde_json::Value> = direct_moves_audit
+                .iter()
+                .map(|mv| serde_json::json!({ "from": mv.source_path, "to": mv.dest_path }))
+                .collect();
+            if let Ok(json_bytes) = serde_json::to_vec(&move_specs) {
+                if fs::write(&bpaths.scratch_moves_json_path, &json_bytes).is_ok() {
+                    if let Err(e) = run_rusty_dedup_record_moves(
+                        tools,
+                        &bpaths.scratch_moves_json_path,
+                        verbose,
+                    ) {
+                        eprintln!(
+                            "  Warning: Failed to record moved paths in SQLite cache ({})",
+                            e
+                        );
+                    }
+                    let _ = fs::remove_file(&bpaths.scratch_moves_json_path);
+                }
+            }
+        }
+    } else {
+        // -----------------------------------------------------------------
+        // Step 2B: Duplicates found ->
+        //   1. Park unrelated non-duplicates outside `misc_dir` (and `<anchor_root>` if custom dest)
+        //   2. Run `rusty_clean` (passing a scratch copy of `dups.json` so the saved
+        //      `dedup/<seq>_..._dups.json` remains 100% pristine!) and write `-o` directly
+        //      into persistent `clean/<seq>_..._clean.json`
+        //   3. Restore parked files immediately
+        // -----------------------------------------------------------------
+        eprintln!(
+            "  [Anchor {:?}] rusty_dedup found {} duplicate group(s); parking unrelated misc files and invoking rusty_clean -> {:?}...",
+            anchor.anchor_path,
+            dedup_report.duplicates.len(),
+            anchor.destination_path
+        );
+
+        let pre_dest_entries = snapshot_dir_files(&anchor.destination_path);
+
+        let mut allowed_inodes: HashSet<(u64, u64)> = HashSet::new();
+        let mut allowed_paths: HashSet<PathBuf> = HashSet::new();
+        let mut batch_lookup_keys: Vec<Vec<PathBuf>> = Vec::with_capacity(batch.len());
+        let mut scan_roots_to_protect: Vec<PathBuf> = Vec::new();
+        let mut seen_scan_roots: HashSet<PathBuf> = HashSet::new();
+
+        for item in batch {
+            allowed_inodes.insert(item.candidate.dev_inode);
+            let norm_p = normalize_path_lexical(&item.candidate.path);
+            let mut keys_for_item = vec![norm_p.clone()];
+            allowed_paths.insert(norm_p.clone());
+            if let Ok(can_p) = fs::canonicalize(&item.candidate.path) {
+                allowed_paths.insert(can_p.clone());
+                if !keys_for_item.contains(&can_p) {
+                    keys_for_item.push(can_p);
+                }
+            }
+            batch_lookup_keys.push(keys_for_item);
+            if let Some(parent) = norm_p.parent() {
+                if seen_scan_roots.insert(parent.to_path_buf()) {
+                    scan_roots_to_protect.push(parent.to_path_buf());
+                }
+            }
+            if let Some(ref mr) = item.candidate.misc_root {
+                if seen_scan_roots.insert(mr.clone()) {
+                    scan_roots_to_protect.push(mr.clone());
+                }
+            }
+        }
+
+        for grp in &dedup_report.duplicates {
+            for f_str in &grp.files {
+                let fp = PathBuf::from(f_str);
+                let norm_fp = normalize_path_lexical(&fp);
+                allowed_paths.insert(norm_fp.clone());
+                if let Ok(meta) = fs::metadata(&fp) {
+                    allowed_inodes.insert(path_dev_inode(&fp, &meta));
+                }
+                if let Some(parent) = norm_fp.parent() {
+                    let under_anchor = norm_fp.starts_with(&anchor.anchor_path)
+                        || norm_fp.starts_with(&anchor.canonical_anchor_path);
+                    if !under_anchor || anchor.has_custom_destination() {
+                        if seen_scan_roots.insert(parent.to_path_buf()) {
+                            scan_roots_to_protect.push(parent.to_path_buf());
+                        }
+                    }
+                }
+            }
+        }
+
+        if anchor.has_custom_destination() && seen_scan_roots.insert(anchor.anchor_path.clone()) {
+            scan_roots_to_protect.push(anchor.anchor_path.clone());
+        }
+
+        fs::copy(&bpaths.dedup_json_path, &bpaths.scratch_clean_input_path).with_context(|| {
+            format!(
+                "Failed to stage working copy of {:?} -> {:?}",
+                bpaths.dedup_json_path, bpaths.scratch_clean_input_path
+            )
+        })?;
+
+        let mut hold_session = TempHoldSession::new(verbose);
+        hold_session.park_unrelated_videos(
+            &scan_roots_to_protect,
+            &allowed_inodes,
+            &allowed_paths,
+            &anchor.destination_path,
+            &scanner_cfg.video_extensions,
+            seq_id,
+        )?;
+
+        let clean_res = run_rusty_clean_command(
+            &bpaths.scratch_clean_input_path,
+            &anchor.destination_path,
+            &bpaths.clean_json_path,
+            tools,
+            verbose,
+        );
+
+        // ALWAYS restore parked files and remove only the ephemeral scratch input copy
+        let restore_res = hold_session.restore_all();
+        let _ = fs::remove_file(&bpaths.scratch_clean_input_path);
+        clean_res?;
+        restore_res?;
+        stats.clean_runs += 1;
+
+        let clean_reports: Vec<CleanGroupDecision> = if bpaths.clean_json_path.is_file() {
+            clean_rel_used = Some(bpaths.clean_rel_path.clone());
+            let raw = fs::read_to_string(&bpaths.clean_json_path)?;
+            serde_json::from_str(&raw).unwrap_or_default()
+        } else {
+            Vec::new()
+        };
+
+        let pair_logs: Vec<PairEvaluationEntry> = if let Some(ref pp) = bpaths.pairs_json_path {
+            if pp.is_file() {
+                let praw = fs::read_to_string(pp)?;
+                serde_json::from_str(&praw).unwrap_or_default()
+            } else {
+                Vec::new()
+            }
+        } else {
+            Vec::new()
+        };
+
+        let (corr_groups, reclaimed_b, moved_winners_b, deleted_cnt, upgrades_cnt) =
+            correlate_duplicate_groups(
+                &anchor.anchor_path,
+                &anchor.canonical_anchor_path,
+                &anchor.destination_path,
+                batch,
+                &dedup_report,
+                &clean_reports,
+                &pair_logs,
+            );
+        dup_groups_audit = corr_groups;
+        batch_bytes_reclaimed += reclaimed_b;
+        batch_bytes_moved += moved_winners_b;
+        batch_dups_deleted += deleted_cnt;
+        batch_upgrades += upgrades_cnt;
+
+        let mut winner_by_member_path: HashMap<PathBuf, PathBuf> = HashMap::new();
+        for grp in &clean_reports {
+            let winner_p = PathBuf::from(&grp.retained_winner);
+            for sc in &grp.scores {
+                let mp = PathBuf::from(&sc.file_path);
+                winner_by_member_path.insert(normalize_path_lexical(&mp), winner_p.clone());
+                if let Ok(can_m) = fs::canonicalize(&mp) {
+                    winner_by_member_path.insert(can_m, winner_p.clone());
+                } else if let (Some(parent), Some(fname)) = (mp.parent(), mp.file_name()) {
+                    if let Ok(can_parent) = fs::canonicalize(parent) {
+                        winner_by_member_path.insert(can_parent.join(fname), winner_p.clone());
+                    }
+                }
+            }
+        }
+
+        let post_dest_entries = snapshot_dir_files(&anchor.destination_path);
+        let new_dest_files: Vec<(PathBuf, (u64, u64), u64)> = post_dest_entries
+            .into_iter()
+            .filter(|(p, _, _)| !pre_dest_entries.iter().any(|(old_p, _, _)| old_p == p))
+            .collect();
+
+        for (i, item) in batch.iter().enumerate() {
+            let orig_norm = normalize_path_lexical(&item.candidate.path);
+            if !orig_norm.exists() {
+                progressed += 1;
+                stats.files_resolved_via_clean += 1;
+            }
+
+            if let Some(w) = batch_lookup_keys[i]
+                .iter()
+                .find_map(|k| winner_by_member_path.get(k))
+            {
+                if w.exists() {
+                    surviving_winner_by_idx.insert(i, w.clone());
                     continue;
                 }
-                let dest = compute_unique_destination(
-                    src,
-                    &anchor.destination_path,
-                    &mut reserved_dest_paths,
-                );
-                let moved_sz = move_file_never_copy(
-                    src,
-                    &dest,
-                    item.candidate.size_bytes,
-                    i + 1,
-                    batch.len(),
-                    verbose,
-                )?;
+            }
+
+            if let Some(found) = resolve_moved_nondup_in_dest(
+                &item.candidate.path,
+                item.candidate.dev_inode,
+                item.candidate.size_bytes,
+                &anchor.destination_path,
+                &new_dest_files,
+            ) {
                 let pm = item.matches.first();
                 direct_moves_audit.push(MovedVideoRecord {
-                    source_path: src.to_string_lossy().to_string(),
-                    dest_path: dest.to_string_lossy().to_string(),
-                    size_bytes: moved_sz,
+                    source_path: item.candidate.path.to_string_lossy().to_string(),
+                    dest_path: found.to_string_lossy().to_string(),
+                    size_bytes: item.candidate.size_bytes,
                     matched_alias: pm.map(|m| m.matched_alias.clone()).unwrap_or_default(),
                     match_tier: pm
                         .map(|m| m.match_tier.as_str().to_string())
                         .unwrap_or_default(),
                     confidence_score: pm.map(|m| m.confidence_score).unwrap_or(0.0),
-                    move_kind: "DIRECT_NO_DUP".to_string(),
+                    move_kind: "CLEAN_PHASE2_NON_DUP".to_string(),
                 });
-                batch_bytes_moved += moved_sz;
-                surviving_winner_by_idx.insert(i, dest);
-                stats.files_moved_directly += 1;
-                progressed += 1;
-            }
-        } else {
-            // -----------------------------------------------------------------
-            // Step 2B: Duplicates found ->
-            //   1. Park unrelated non-duplicates outside `misc_dir` (and `<anchor_root>` if custom dest)
-            //   2. Run `rusty_clean` (passing a scratch copy of `dups.json` so the saved
-            //      `dedup/<seq>_..._dups.json` remains 100% pristine!) and write `-o` directly
-            //      into persistent `clean/<seq>_..._clean.json`
-            //   3. Restore parked files immediately
-            // -----------------------------------------------------------------
-            eprintln!(
-                "  [Anchor {:?}] rusty_dedup found {} duplicate group(s); parking unrelated misc files and invoking rusty_clean -> {:?}...",
-                anchor.anchor_path,
-                dedup_report.duplicates.len(),
-                anchor.destination_path
-            );
-
-            let pre_dest_entries = snapshot_dir_files(&anchor.destination_path);
-
-            let mut allowed_inodes: HashSet<(u64, u64)> = HashSet::new();
-            let mut allowed_paths: HashSet<PathBuf> = HashSet::new();
-            let mut batch_lookup_keys: Vec<Vec<PathBuf>> = Vec::with_capacity(batch.len());
-            let mut scan_roots_to_protect: Vec<PathBuf> = Vec::new();
-            let mut seen_scan_roots: HashSet<PathBuf> = HashSet::new();
-
-            for item in batch {
-                allowed_inodes.insert(item.candidate.dev_inode);
-                let norm_p = normalize_path_lexical(&item.candidate.path);
-                let mut keys_for_item = vec![norm_p.clone()];
-                allowed_paths.insert(norm_p.clone());
-                if let Ok(can_p) = fs::canonicalize(&item.candidate.path) {
-                    allowed_paths.insert(can_p.clone());
-                    if !keys_for_item.contains(&can_p) {
-                        keys_for_item.push(can_p);
-                    }
-                }
-                batch_lookup_keys.push(keys_for_item);
-                if let Some(parent) = norm_p.parent() {
-                    if seen_scan_roots.insert(parent.to_path_buf()) {
-                        scan_roots_to_protect.push(parent.to_path_buf());
-                    }
-                }
-                if let Some(ref mr) = item.candidate.misc_root {
-                    if seen_scan_roots.insert(mr.clone()) {
-                        scan_roots_to_protect.push(mr.clone());
-                    }
-                }
-            }
-
-            for grp in &dedup_report.duplicates {
-                for f_str in &grp.files {
-                    let fp = PathBuf::from(f_str);
-                    let norm_fp = normalize_path_lexical(&fp);
-                    allowed_paths.insert(norm_fp.clone());
-                    if let Ok(meta) = fs::metadata(&fp) {
-                        allowed_inodes.insert(path_dev_inode(&fp, &meta));
-                    }
-                    if let Some(parent) = norm_fp.parent() {
-                        let under_anchor = norm_fp.starts_with(&anchor.anchor_path)
-                            || norm_fp.starts_with(&anchor.canonical_anchor_path);
-                        if !under_anchor || anchor.has_custom_destination() {
-                            if seen_scan_roots.insert(parent.to_path_buf()) {
-                                scan_roots_to_protect.push(parent.to_path_buf());
-                            }
-                        }
-                    }
-                }
-            }
-
-            if anchor.has_custom_destination()
-                && seen_scan_roots.insert(anchor.anchor_path.clone())
-            {
-                scan_roots_to_protect.push(anchor.anchor_path.clone());
-            }
-
-            fs::copy(&bpaths.dedup_json_path, &bpaths.scratch_clean_input_path).with_context(
-                || {
-                    format!(
-                        "Failed to stage working copy of {:?} -> {:?}",
-                        bpaths.dedup_json_path, bpaths.scratch_clean_input_path
-                    )
-                },
-            )?;
-
-            let mut hold_session = TempHoldSession::new(verbose);
-            hold_session.park_unrelated_videos(
-                &scan_roots_to_protect,
-                &allowed_inodes,
-                &allowed_paths,
-                &anchor.destination_path,
-                &scanner_cfg.video_extensions,
-                seq_id * 100 + chunk_idx,
-            )?;
-
-            let clean_res = run_rusty_clean_command(
-                &bpaths.scratch_clean_input_path,
-                &anchor.destination_path,
-                &bpaths.clean_json_path,
-                tools,
-                verbose,
-            );
-
-            // ALWAYS restore parked files and remove only the ephemeral scratch input copy
-            let restore_res = hold_session.restore_all();
-            let _ = fs::remove_file(&bpaths.scratch_clean_input_path);
-            clean_res?;
-            restore_res?;
-            stats.clean_runs += 1;
-
-            let clean_reports: Vec<CleanGroupDecision> = if bpaths.clean_json_path.is_file() {
-                clean_rel_used = Some(bpaths.clean_rel_path.clone());
-                let raw = fs::read_to_string(&bpaths.clean_json_path)?;
-                serde_json::from_str(&raw).unwrap_or_default()
-            } else {
-                Vec::new()
-            };
-
-            let pair_logs: Vec<PairEvaluationEntry> = if let Some(ref pp) = bpaths.pairs_json_path
-            {
-                if pp.is_file() {
-                    let praw = fs::read_to_string(pp)?;
-                    serde_json::from_str(&praw).unwrap_or_default()
-                } else {
-                    Vec::new()
-                }
-            } else {
-                Vec::new()
-            };
-
-            let (corr_groups, reclaimed_b, moved_winners_b, deleted_cnt, upgrades_cnt) =
-                correlate_duplicate_groups(
-                    &anchor.anchor_path,
-                    &anchor.canonical_anchor_path,
-                    &anchor.destination_path,
-                    batch,
-                    &dedup_report,
-                    &clean_reports,
-                    &pair_logs,
-                );
-            dup_groups_audit = corr_groups;
-            batch_bytes_reclaimed += reclaimed_b;
-            batch_bytes_moved += moved_winners_b;
-            batch_dups_deleted += deleted_cnt;
-            batch_upgrades += upgrades_cnt;
-
-            let mut winner_by_member_path: HashMap<PathBuf, PathBuf> = HashMap::new();
-            for grp in &clean_reports {
-                let winner_p = PathBuf::from(&grp.retained_winner);
-                for sc in &grp.scores {
-                    let mp = PathBuf::from(&sc.file_path);
-                    winner_by_member_path.insert(normalize_path_lexical(&mp), winner_p.clone());
-                    if let Ok(can_m) = fs::canonicalize(&mp) {
-                        winner_by_member_path.insert(can_m, winner_p.clone());
-                    } else if let (Some(parent), Some(fname)) = (mp.parent(), mp.file_name()) {
-                        if let Ok(can_parent) = fs::canonicalize(parent) {
-                            winner_by_member_path.insert(can_parent.join(fname), winner_p.clone());
-                        }
-                    }
-                }
-            }
-
-            let post_dest_entries = snapshot_dir_files(&anchor.destination_path);
-            let new_dest_files: Vec<(PathBuf, (u64, u64), u64)> = post_dest_entries
-                .into_iter()
-                .filter(|(p, _, _)| !pre_dest_entries.iter().any(|(old_p, _, _)| old_p == p))
-                .collect();
-
-            for (i, item) in batch.iter().enumerate() {
-                let orig_norm = normalize_path_lexical(&item.candidate.path);
-                if !orig_norm.exists() {
-                    progressed += 1;
-                    stats.files_resolved_via_clean += 1;
-                }
-
-                if let Some(w) = batch_lookup_keys[i]
-                    .iter()
-                    .find_map(|k| winner_by_member_path.get(k))
-                {
-                    if w.exists() {
-                        surviving_winner_by_idx.insert(i, w.clone());
-                        continue;
-                    }
-                }
-
-                if let Some(found) = resolve_moved_nondup_in_dest(
-                    &item.candidate.path,
-                    item.candidate.dev_inode,
-                    item.candidate.size_bytes,
-                    &anchor.destination_path,
-                    &new_dest_files,
-                ) {
-                    let pm = item.matches.first();
-                    direct_moves_audit.push(MovedVideoRecord {
-                        source_path: item.candidate.path.to_string_lossy().to_string(),
-                        dest_path: found.to_string_lossy().to_string(),
-                        size_bytes: item.candidate.size_bytes,
-                        matched_alias: pm.map(|m| m.matched_alias.clone()).unwrap_or_default(),
-                        match_tier: pm
-                            .map(|m| m.match_tier.as_str().to_string())
-                            .unwrap_or_default(),
-                        confidence_score: pm.map(|m| m.confidence_score).unwrap_or(0.0),
-                        move_kind: "CLEAN_PHASE2_NON_DUP".to_string(),
-                    });
-                    batch_bytes_moved += item.candidate.size_bytes;
-                    surviving_winner_by_idx.insert(i, found);
-                }
+                batch_bytes_moved += item.candidate.size_bytes;
+                surviving_winner_by_idx.insert(i, found);
             }
         }
+    }
 
-        // ---------------------------------------------------------------------
-        // Step 3: Create softlinks in Rank #2, #3, #4 anchors (`PlannedAction::Symlink`)
-        // ---------------------------------------------------------------------
-        let mut batch_symlinks: Vec<SymlinkRecord> = Vec::new();
-        let mut batch_symlinks_skipped = 0usize;
+    // ---------------------------------------------------------------------
+    // Step 3: Create softlinks in Rank #2, #3, #4 anchors (`PlannedAction::Symlink`)
+    // ---------------------------------------------------------------------
+    let mut batch_symlinks: Vec<SymlinkRecord> = Vec::new();
+    let mut batch_symlinks_skipped = 0usize;
 
-        for (i, item) in batch.iter().enumerate() {
-            let Some(winner_path) = surviving_winner_by_idx.get(&i) else {
-                continue;
-            };
-            if !winner_path.exists() {
+    for (i, item) in batch.iter().enumerate() {
+        let Some(winner_path) = surviving_winner_by_idx.get(&i) else {
+            continue;
+        };
+        if !winner_path.exists() {
+            continue;
+        }
+        let winner_inode = fs::metadata(winner_path)
+            .ok()
+            .map(|m| path_dev_inode(winner_path, &m));
+
+        let orig_stem = item
+            .candidate
+            .path
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("video");
+        let winner_ext = winner_path
+            .extension()
+            .and_then(|e| e.to_str())
+            .unwrap_or("");
+
+        for sec_match in &item.matches {
+            if sec_match.planned_action != PlannedAction::Symlink {
                 continue;
             }
-            let winner_inode = fs::metadata(winner_path)
+            let sec_dest = &sec_match.destination_path;
+            fs::create_dir_all(sec_dest).with_context(|| {
+                format!(
+                    "Failed to create secondary symlink destination {:?}",
+                    sec_dest
+                )
+            })?;
+
+            let sec_dest_inode = fs::metadata(sec_dest)
                 .ok()
-                .map(|m| path_dev_inode(winner_path, &m));
-
-            let orig_stem = item
-                .candidate
-                .path
-                .file_stem()
-                .and_then(|s| s.to_str())
-                .unwrap_or("video");
-            let winner_ext = winner_path
-                .extension()
-                .and_then(|e| e.to_str())
-                .unwrap_or("");
-
-            for sec_match in &item.matches {
-                if sec_match.planned_action != PlannedAction::Symlink {
+                .map(|m| path_dev_inode(sec_dest, &m));
+            if let Some(wparent) = winner_path.parent() {
+                if are_same_dir(wparent, sec_dest, sec_dest_inode) {
                     continue;
                 }
-                let sec_dest = &sec_match.destination_path;
-                fs::create_dir_all(sec_dest).with_context(|| {
-                    format!(
-                        "Failed to create secondary symlink destination {:?}",
-                        sec_dest
-                    )
-                })?;
-
-                let sec_dest_inode = fs::metadata(sec_dest)
-                    .ok()
-                    .map(|m| path_dev_inode(sec_dest, &m));
-                if let Some(wparent) = winner_path.parent() {
-                    if are_same_dir(wparent, sec_dest, sec_dest_inode) {
-                        continue;
-                    }
-                }
-
-                if let Some(w_ino) = winner_inode {
-                    if dir_already_references_inode(sec_dest, w_ino) {
-                        stats.secondary_symlinks_skipped_existing += 1;
-                        batch_symlinks_skipped += 1;
-                        if verbose {
-                            eprintln!(
-                                "    [Verbose][Symlink Rank #{}] {:?} already references winner inode; skipping.",
-                                sec_match.rank, sec_dest
-                            );
-                        }
-                        continue;
-                    }
-                }
-
-                let link_path = compute_unique_symlink_path(sec_dest, orig_stem, winner_ext);
-                create_softlink(winner_path, &link_path).with_context(|| {
-                    format!(
-                        "Failed to create Rank #{} symlink {:?} -> {:?}",
-                        sec_match.rank, link_path, winner_path
-                    )
-                })?;
-                stats.secondary_symlinks_created += 1;
-                batch_symlinks.push(SymlinkRecord {
-                    rank: sec_match.rank,
-                    source_misc_path: item.candidate.path.to_string_lossy().to_string(),
-                    secondary_anchor_path: sec_match.anchor_path.to_string_lossy().to_string(),
-                    link_path: link_path.to_string_lossy().to_string(),
-                    target_winner_path: winner_path.to_string_lossy().to_string(),
-                    matched_alias: sec_match.matched_alias.clone(),
-                    confidence_score: sec_match.confidence_score,
-                });
-                println!(
-                    "    ⇢ [Rank #{} Symlink] {:?} -> {:?}",
-                    sec_match.rank, link_path, winner_path
-                );
             }
-        }
 
-        // ---------------------------------------------------------------------
-        // Step 4: Persist incremental `run_manifest.json` + `execution_report.html`
-        //         (Both `bpaths.dedup_json_path` and `bpaths.clean_json_path` stay permanently!)
-        // ---------------------------------------------------------------------
-        let anchor_name = anchor
-            .anchor_path
-            .file_name()
-            .and_then(|s| s.to_str())
-            .unwrap_or(&anchor.raw_key)
-            .to_string();
-        report_store.record_anchor_batch(AnchorBatchAudit {
-            seq_id: if sub_batches.len() == 1 {
-                seq_id
-            } else {
-                seq_id * 100 + chunk_idx
-            },
-            pass_num,
-            chunk_idx,
-            anchor_name,
-            anchor_path: anchor.anchor_path.to_string_lossy().to_string(),
-            destination_path: anchor.destination_path.to_string_lossy().to_string(),
-            matched_input_count: batch.len(),
-            elapsed_ms: chunk_start.elapsed().as_millis() as u64,
-            dedup_report_rel_path: bpaths.dedup_rel_path,
-            clean_report_rel_path: clean_rel_used,
-            pairs_log_rel_path: pairs_rel_used,
-            direct_moves: direct_moves_audit,
-            duplicate_groups: dup_groups_audit,
-            symlinks_created: batch_symlinks,
-            symlinks_skipped_existing: batch_symlinks_skipped,
-            bytes_moved: batch_bytes_moved,
-            bytes_reclaimed: batch_bytes_reclaimed,
-            duplicates_deleted: batch_dups_deleted,
-            anchor_upgrades_count: batch_upgrades,
-            errors: Vec::new(),
-        })?;
+            if let Some(w_ino) = winner_inode {
+                if dir_already_references_inode(sec_dest, w_ino) {
+                    stats.secondary_symlinks_skipped_existing += 1;
+                    batch_symlinks_skipped += 1;
+                    if verbose {
+                        eprintln!(
+                            "    [Verbose][Symlink Rank #{}] {:?} already references winner inode; skipping.",
+                            sec_match.rank, sec_dest
+                        );
+                    }
+                    continue;
+                }
+            }
+
+            let link_path = compute_unique_symlink_path(sec_dest, orig_stem, winner_ext);
+            create_softlink(winner_path, &link_path).with_context(|| {
+                format!(
+                    "Failed to create Rank #{} symlink {:?} -> {:?}",
+                    sec_match.rank, link_path, winner_path
+                )
+            })?;
+            stats.secondary_symlinks_created += 1;
+            batch_symlinks.push(SymlinkRecord {
+                rank: sec_match.rank,
+                source_misc_path: item.candidate.path.to_string_lossy().to_string(),
+                secondary_anchor_path: sec_match.anchor_path.to_string_lossy().to_string(),
+                link_path: link_path.to_string_lossy().to_string(),
+                target_winner_path: winner_path.to_string_lossy().to_string(),
+                matched_alias: sec_match.matched_alias.clone(),
+                confidence_score: sec_match.confidence_score,
+            });
+            println!(
+                "    ⇢ [Rank #{} Symlink] {:?} -> {:?}",
+                sec_match.rank, link_path, winner_path
+            );
+        }
     }
+
+    // ---------------------------------------------------------------------
+    // Step 4: Persist incremental `run_manifest.json` + `execution_report.html`
+    //         (Both `bpaths.dedup_json_path` and `bpaths.clean_json_path` stay permanently!)
+    // ---------------------------------------------------------------------
+    let anchor_name = anchor
+        .anchor_path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or(&anchor.raw_key)
+        .to_string();
+    report_store.record_anchor_batch(AnchorBatchAudit {
+        seq_id,
+        pass_num,
+        chunk_idx: 0,
+        anchor_name,
+        anchor_path: anchor.anchor_path.to_string_lossy().to_string(),
+        destination_path: anchor.destination_path.to_string_lossy().to_string(),
+        matched_input_count: batch.len(),
+        elapsed_ms: chunk_start.elapsed().as_millis() as u64,
+        dedup_report_rel_path: bpaths.dedup_rel_path,
+        clean_report_rel_path: clean_rel_used,
+        pairs_log_rel_path: pairs_rel_used,
+        direct_moves: direct_moves_audit,
+        duplicate_groups: dup_groups_audit,
+        symlinks_created: batch_symlinks,
+        symlinks_skipped_existing: batch_symlinks_skipped,
+        bytes_moved: batch_bytes_moved,
+        bytes_reclaimed: batch_bytes_reclaimed,
+        duplicates_deleted: batch_dups_deleted,
+        anchor_upgrades_count: batch_upgrades,
+        errors: Vec::new(),
+    })?;
 
     Ok(progressed)
 }
 
-fn split_into_cli_safe_batches(files: &[FileMatchResult]) -> Vec<Vec<FileMatchResult>> {
-    let mut batches: Vec<Vec<FileMatchResult>> = Vec::new();
-    let mut current: Vec<FileMatchResult> = Vec::new();
-    let mut current_bytes = 0usize;
-
-    for item in files {
-        let p_len = item.candidate.path.as_os_str().len() + 4;
-        if !current.is_empty() && current_bytes + p_len > MAX_DEDUP_CLI_ARG_BYTES {
-            batches.push(std::mem::take(&mut current));
-            current_bytes = 0;
-        }
-        current_bytes += p_len;
-        current.push(item.clone());
+fn run_rusty_dedup_record_moves(
+    tools: &ResolvedTools,
+    moves_json: &Path,
+    verbose: bool,
+) -> Result<()> {
+    let mut cmd = Command::new(&tools.rusty_dedup_bin);
+    cmd.arg("--states-dir").arg(&tools.states_dir);
+    cmd.arg("--record-moves").arg(moves_json);
+    if verbose {
+        cmd.arg("-v");
     }
-    if !current.is_empty() {
-        batches.push(current);
+    let status = cmd
+        .status()
+        .with_context(|| format!("Failed to launch {:?} --record-moves", tools.rusty_dedup_bin))?;
+    if !status.success() {
+        bail!("rusty_dedup --record-moves exited with status {}", status);
     }
-    batches
+    Ok(())
 }
 
 fn run_rusty_dedup_command(
     anchor: &AnchorEntry,
-    batch: &[FileMatchResult],
+    inputs_list_file: &Path,
     tools: &ResolvedTools,
     output_json: &Path,
     categories_log_json: Option<&Path>,
@@ -1441,10 +1534,7 @@ fn run_rusty_dedup_command(
     if verbose {
         cmd.arg("-v");
     }
-    cmd.arg(&anchor.anchor_path);
-    for item in batch {
-        cmd.arg(&item.candidate.path);
-    }
+    cmd.arg("--inputs-from").arg(inputs_list_file);
 
     if verbose {
         eprintln!("  [Verbose][Exec] {:?}", cmd);
@@ -1483,6 +1573,7 @@ fn run_rusty_clean_command(
         cmd.arg("-c").arg(dec_cfg);
     }
     cmd.arg("-t").arg(target_dest);
+    cmd.arg("--states-dir").arg(&tools.states_dir);
     cmd.arg("-o").arg(clean_report_out);
     if verbose {
         cmd.arg("-v");
@@ -1638,6 +1729,7 @@ pub fn move_file_never_copy(
         }
     }
 
+    let src_modified = fs::metadata(src).ok().and_then(|m| m.modified().ok());
     let mut reader = File::open(src)
         .with_context(|| format!("Failed to open {:?} for cross-volume move", src))?;
     let mut writer = File::create(dest)
@@ -1652,6 +1744,9 @@ pub fn move_file_never_copy(
         }
         writer.write_all(&buf[..n])?;
         copied += n as u64;
+    }
+    if let Some(mtime) = src_modified {
+        let _ = writer.set_modified(mtime);
     }
     writer.sync_all()?;
     drop(writer);
